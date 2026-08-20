@@ -22,6 +22,7 @@ from .xfm import Transform
 if TYPE_CHECKING:
     from cortex.dataset.dataset import Dataset
     from cortex.dataset.views import Vertex
+    from cortex.electrodes import ElectrodeSet
     from cortex.svgoverlay import SVGOverlay
 
 default_filestore = options.config.get('basic', 'filestore')
@@ -35,6 +36,7 @@ class PathsType(TypedDict):
     masks: str
     rois: str
     overlays: str
+    electrodes: str
     views: list[str]
     surf2surf: str
 
@@ -399,6 +401,64 @@ class Database:
             overlay_file = paths['overlays']
         return svgoverlay.get_overlay(subject, overlay_file, pts, polys, **kwargs)
     
+    def get_electrodes(self, subject: str, name: str="electrodes") -> "ElectrodeSet":
+        """Load a subject's intracranial electrodes from the filestore.
+
+        Electrode sets live beside the surfaces, at
+        ``<filestore>/<subject>/electrodes/<name>.json``, for the same reason
+        ROIs do: they annotate a subject's anatomy rather than any particular
+        dataset, and every figure and viewer for that subject wants the same
+        ones.
+
+        Parameters
+        ----------
+        subject : str
+        name : str
+            Which set, for subjects with more than one -- a clinical montage
+            and a research subset, say.
+
+        Returns
+        -------
+        ElectrodeSet
+        """
+        from .electrodes import load_electrodes_json
+
+        fname = self.get_paths(subject)['electrodes'].format(name=name)
+        if not os.path.exists(fname):
+            raise IOError(
+                "No electrode set %r for subject %s. Available: %s"
+                % (name, subject, ", ".join(self.list_electrodes(subject)) or "none")
+            )
+        eset = load_electrodes_json(fname)
+        eset.subject = subject
+        return eset
+
+    def save_electrodes(self, subject: str, eset: "ElectrodeSet", name: str="electrodes",
+                        overwrite: bool=False) -> str:
+        """Write an electrode set into the subject's filestore.
+
+        Anchors are written along with the coordinates, together with the hash
+        of the surfaces they were computed against, so a set saved before a
+        surface was re-imported can be recognised as stale rather than quietly
+        drawn in the wrong place.
+        """
+        from .electrodes import save_electrodes_json
+
+        fname = self.get_paths(subject)['electrodes'].format(name=name)
+        if os.path.exists(fname) and not overwrite:
+            raise IOError("Refusing to overwrite existing electrode set %s" % fname)
+        save_electrodes_json(eset, fname)
+        return fname
+
+    def list_electrodes(self, subject: str) -> list[str]:
+        """The names of the electrode sets this subject has, possibly none."""
+        directory = os.path.dirname(self.get_paths(subject)['electrodes'])
+        if not os.path.exists(directory):
+            return []
+        return sorted(
+            os.path.splitext(f)[0] for f in os.listdir(directory) if f.endswith(".json")
+        )
+
     def save_xfm(self, subject: str, name: str, xfm: npt.NDArray[np.floating], xfmtype: str="magnet", reference: Optional[str]=None):
         """
         Load a transform into the surface database. If the transform exists already, update it
@@ -751,6 +811,7 @@ class Database:
             masks=os.path.join(self.filestore, subject, 'transforms', '{xfmname}', 'mask_{type}.nii.gz'),
             rois=os.path.join(self.filestore, subject, "rois.svg").format(subj=subject),
             overlays=os.path.join(self.filestore, subject, "overlays.svg").format(subj=subject),
+            electrodes=os.path.join(self.filestore, subject, "electrodes", "{name}.json"),
             views=sorted([os.path.splitext(f)[0] for f in views]),
             surf2surf=os.path.join(self.filestore, subject, "surf2surf", "{source}_to_{target}", "matrices_{surface_type}.hdf"),
         )

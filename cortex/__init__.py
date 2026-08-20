@@ -2,6 +2,7 @@
 # vi: set fileencoding=utf-8 ft=python sts=4 ts=4 sw=4 et:
 from cortex.dataset import Dataset, Volume, Vertex, VolumeRGB, VertexRGB, Volume2D, Vertex2D, Colors
 from cortex import align, volume, quickflat, webgl, segment, options
+from cortex import electrodes
 from cortex.database import db
 from cortex.utils import *
 from cortex.quickflat import make_figure as quickshow

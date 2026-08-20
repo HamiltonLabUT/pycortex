@@ -62,12 +62,19 @@ coordinates should drop straight onto `fiducial`/`pia` with no transform.
 
 Two caveats that must be enforced in code rather than assumed:
 
-- **Verify, don't trust.** Ship a check that reports the distance from each
-  electrode to the nearest pial vertex; a whole-subject offset of ~1-10 mm is the
-  signature of a `c_ras` mismatch and should raise rather than quietly project
-  every contact to the wrong gyrus. This matters more than usual given the
-  abnormal anatomy in the dataset — a systematic offset and a genuinely displaced
-  electrode look the same one at a time.
+- **Verify, don't trust** — but know what verification can reach. `check_alignment`
+  reports each electrode's distance to the pial surface and how much of that
+  distance is a single common direction. Measured on S1 with a synthetic 64-contact
+  grid: correct placement gives a 1.6 mm median offset, a 15 mm error gives 12.3 mm
+  and a 40 mm error gives 33 mm, so a shift that lifts electrodes *off* the sheet is
+  caught easily. A shift *along* the sheet is not caught at all and cannot be — an
+  8 mm tangential error leaves the median offset at 1.0 mm, because the grid slides
+  onto a neighbouring gyrus and sits just as snugly. Only the anatomical labels can
+  see that one. Two further caveats worth stating in the API rather than
+  discovering later: cortex folds, so a *scattered* set is far more forgiving than
+  a contiguous one — judge a montage by its grids, not its outliers — and a montage
+  that is mostly sEEG will report a large median offset and read as suspicious when
+  it is fine, since depth contacts are legitimately centimetres from the pia.
 - **Never anchor on a nudged surface.** `db.get_surf(..., nudge=True)` shifts
   non-fiducial hemispheres in x (`cortex/database.py:554`). Anchoring happens on
   `pia`/`fiducial` with `nudge=False`; nudging is a display-time concern.
@@ -108,25 +115,36 @@ each other, and it keeps STRFs out of the space.
 ### 2.2 Anchoring
 
 The anchor is found against the **pia-to-white-matter slab**, not against a
-single surface. `pia` and `wm` share vertex indexing and polygons, so one face
-index names a triangle on both; the search picks the face minimising distance to
-the electrode across that slab, and the barycentric weights and depth then follow
-from that face's pial and white-matter triangles. Anchoring against one surface
-alone would make the depth coordinate in 2.3 unrecoverable.
+single surface: the search runs on the mid-surface `(pia + wm) / 2`, which is
+the least biased place to look for the column an electrode belongs to, and the
+barycentric weights and depth then follow from that triangle's pial and
+white-matter versions. Anchoring against one surface alone would make the depth
+coordinate in 2.3 unrecoverable, and searching on the pia alone pulls
+superficial contacts onto the near bank of a sulcus.
 
 Store, per electrode, computed once:
 
 ```
-hemi, face_idx, bary_w[3], depth, distance_mm, placement
+hemi, verts[3], bary_w[3], depth, offset_mm, placement
 ```
 
-where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3.
+where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3
+and `offset_mm` is the perpendicular distance from the electrode to the column
+it was assigned to.
 
-Position in any surface is `bary_w @ pts[polys[face_idx]]`, valid in fiducial,
-inflated and flat alike because every pycortex surface shares vertex indexing.
-Barycentric rather than nearest-vertex because contacts are 3-10 mm apart while
-vertices are ~0.5-1 mm apart: nearest-vertex snapping visibly distorts within-grid
-spacing, and barycentric costs three extra floats.
+**Vertex indices, not a face index.** This looks like a detail and is not.
+A face index is *not* shared between a subject's surfaces: flattening cuts the
+medial wall away, so on S1 the pial surface has 305,782 triangles and the flat
+surface 291,351, and face `k` is a different triangle on each. Storing a face
+index evaluates silently and wrongly on the flat surface -- it was written that
+way first, and the test that caught it is
+`test_a_flat_position_is_the_flat_coordinate_of_that_vertex`. Vertex indexing is
+shared by every surface, which is the only thing that makes an anchor portable.
+
+Position on any surface is then `bary_w @ pts[verts]`, needing no polygons at
+all. Barycentric rather than nearest-vertex because contacts are 3-10 mm apart
+while vertices are ~0.5-1 mm apart: nearest-vertex snapping visibly distorts
+within-grid spacing, and barycentric costs three extra floats.
 
 **`placement` is an explicit enum on every electrode**, never a silent drop:
 `on_surface`, `projected`, `too_far`, `unknown_anatomy`. The design document's
@@ -265,9 +283,12 @@ labs' files load without a bespoke parser.
 
 Each phase is independently verifiable and independently useful.
 
-- **P0** — `ElectrodeSet`, barycentric anchoring, the depth coordinate, IO,
-  placement policy, coordinate check. Pure Python, no rendering, fully
-  unit-testable.
+- **P0** — *done.* `ElectrodeSet`, barycentric anchoring, the depth coordinate,
+  BIDS and JSON IO, placement policy, coordinate check, filestore round-trip.
+  Pure Python, no rendering. 95 tests: `test_electrode_anchor.py` (synthetic
+  two-plane cortex, so the arithmetic is checkable by hand),
+  `test_electrodes.py` (the set, selection, both file formats) and
+  `test_electrodes_subject.py` (the real S1 surfaces and a scratch filestore).
 - **P1** — `add_electrodes` for quickflat. First visible output, no JavaScript.
 - **P2** — `ElectrodeSpace` and the three views: colormapping, HDF, movies.
 - **P3** — webgl markers, `mix` tracking, shapes, sizes, filtering, hover and
