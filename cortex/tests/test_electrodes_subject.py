@@ -104,6 +104,33 @@ def test_cortical_thickness_at_the_anchors_is_plausible(midpoint_electrodes):
     assert 1.0 < float(np.median(anchors.thickness_mm)) < 4.5
 
 
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 0.75, 1.0])
+def test_depth_is_recovered_across_the_ribbon(pairs, fraction):
+    """Contacts placed at a known fraction through the ribbon come back at it.
+
+    The midpoint test above is a special case that is exact by construction --
+    the midpoint is a vertex of the surface the candidate search runs on. This
+    one covers the rest of the ribbon, where the answer depends on the face
+    *selection* criterion. Selecting candidates by distance to the mid-surface
+    (as this did first) biases depth toward the middle, because a contact on
+    the pia over a curved patch finds a nearer mid-surface point on a
+    neighbouring column: mean error 0.073, worst case 0.38. Selecting by
+    distance to the cortical column gives the tolerances below.
+    """
+    pair = pairs["lh"]
+    pia, wm = pair.pia.astype(np.float64), pair.wm.astype(np.float64)
+    idx = np.random.default_rng(1).choice(len(pia), 40, replace=False)
+    coords = pia[idx] + fraction * (wm[idx] - pia[idx])
+
+    eset = ElectrodeSet(["e%d" % i for i in range(len(idx))], coords, subject=SUBJECT)
+    anchors = eset.anchor(surfaces={"lh": pair})
+
+    error = np.abs(anchors.depth - fraction)
+    assert np.median(error) < 0.02
+    assert np.percentile(error, 90) < 0.05
+    assert error.max() < 0.35
+
+
 def test_hemispheres_are_recovered_from_the_geometry(midpoint_electrodes):
     eset, _, hemis = midpoint_electrodes
     anchors = eset.anchor()

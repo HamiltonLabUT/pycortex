@@ -103,9 +103,11 @@ def test_a_mismatched_metadata_column_is_refused():
         ElectrodeSet(names=["A1", "A2"], coords=np.zeros((2, 3)), status=["good"])
 
 
-def test_an_empty_set_is_refused():
-    with pytest.raises(ValueError, match="at least one"):
-        ElectrodeSet(names=[], coords=np.zeros((0, 3)))
+def test_an_empty_set_is_legal(eset):
+    """Because `select()` returning nothing is an ordinary answer, not an error."""
+    empty = ElectrodeSet(names=[], coords=np.zeros((0, 3)))
+    assert len(empty) == 0 and empty.groups == []
+    assert len(eset.select(group="NO_SUCH_GROUP")) == 0
 
 
 # -- access -----------------------------------------------------------------

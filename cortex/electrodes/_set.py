@@ -163,8 +163,6 @@ class ElectrodeSet:
     ) -> None:
         self.names = np.array([str(n) for n in names], dtype=str)
         n = len(self.names)
-        if n == 0:
-            raise ValueError("an ElectrodeSet needs at least one electrode")
         unique, counts = np.unique(self.names, return_counts=True)
         if len(unique) != n:
             raise ValueError(
@@ -172,7 +170,14 @@ class ElectrodeSet:
                 % ", ".join(unique[counts > 1])
             )
 
-        self.coords = np.atleast_2d(np.asarray(coords, dtype=np.float64))
+        # An empty set is legal, and has to be: `select()` returning nothing is
+        # an ordinary answer -- no electrode in that group, none at that depth --
+        # and raising there would make every caller pre-check before filtering.
+        self.coords = (
+            np.zeros((0, 3))
+            if n == 0
+            else np.atleast_2d(np.asarray(coords, dtype=np.float64))
+        )
         if self.coords.shape != (n, 3):
             raise ValueError(
                 "coords must be (%d, 3), got %r" % (n, self.coords.shape)
@@ -274,6 +279,8 @@ class ElectrodeSet:
     @property
     def groups(self) -> list[str]:
         """The distinct electrode groups, in first-appearance order."""
+        if not len(self):
+            return []
         _, first = np.unique(self.group, return_index=True)
         return [str(g) for g in self.group[np.sort(first)]]
 

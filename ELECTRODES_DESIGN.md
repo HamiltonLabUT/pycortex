@@ -132,6 +132,18 @@ where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3
 and `offset_mm` is the perpendicular distance from the electrode to the column
 it was assigned to.
 
+**Selection is by distance to the cortical column, not to the mid-surface.**
+The candidate triangles come from the mid-surface, but choosing among them by
+mid-surface distance biases depth toward the middle of the ribbon: a contact
+sitting on the pia over a curved patch finds a nearer mid-surface point on a
+*neighbouring* column. Measured on S1 over 160 contacts at known depths, that
+gives a mean depth error of 0.073 and a worst case of 0.38 — enough that a
+contact placed on the pia reports depth 0.37. Selecting instead by distance to
+the clamped pia-to-wm segment costs nothing (the quantities are already
+computed) and gives 0.006 and 0.17. Since depth is the axis the viewer's slider
+rides on, that error matters more than its size suggests. Pinned by
+`test_depth_is_recovered_across_the_ribbon`.
+
 **Vertex indices, not a face index.** This looks like a detail and is not.
 A face index is *not* shared between a subject's surfaces: flattening cuts the
 medial wall away, so on S1 the pial surface has 305,782 triangles and the flat
@@ -289,7 +301,26 @@ Each phase is independently verifiable and independently useful.
   two-plane cortex, so the arithmetic is checkable by hand),
   `test_electrodes.py` (the set, selection, both file formats) and
   `test_electrodes_subject.py` (the real S1 surfaces and a scratch filestore).
-- **P1** — `add_electrodes` for quickflat. First visible output, no JavaScript.
+- **P1** — *done.* `add_electrodes` for quickflat, `with_electrodes` on
+  `make_figure` (and so on `make_png`/`make_svg`, which forward `**kwargs`), and
+  `examples/electrodes/plot_electrodes_flatmap.py`. 24 tests in
+  `test_quickflat_electrodes.py`, asserting on the marker collections rather
+  than on pixels.
+
+  Two decisions worth recording. Electrode depth is a **separate argument from
+  `make_figure`'s existing `depth`**: that one is the volumetric *sampling*
+  depth for `add_data`, and someone sampling their fMRI at `depth=0.5` has not
+  thereby asked to hide all but mid-ribbon contacts. And electrodes are drawn
+  **after `add_cutout`**, because they are scatter markers rather than image
+  layers: `add_cutout` iterates its `layers` calling `get_array()` and would
+  choke on a `PathCollection`. Drawing them afterwards means the cutout's reset
+  axis limits clip them instead, which is right except for a marker inside the
+  cutout's bounding box and outside its outline.
+
+  Marker shape follows group type by default — circle for a grid, square for a
+  strip, diamond for seeg and depth — so a reader can tell which positions to
+  trust without consulting a legend. Marker *size* is constant in figure units
+  and deliberately not scaled by areal distortion, per 2.2.
 - **P2** — `ElectrodeSpace` and the three views: colormapping, HDF, movies.
 - **P3** — webgl markers, `mix` tracking, shapes, sizes, filtering, hover and
   click.

@@ -1,8 +1,9 @@
 import copy
-from typing import Optional, Union, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Union, Sequence
 
 from matplotlib.axes import Axes
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PathCollection
+from matplotlib.typing import ColorType
 from matplotlib.figure import Figure
 from matplotlib.image import AxesImage
 import numpy as np
@@ -15,6 +16,9 @@ from ..dataset.views import HasSubject, as_renderable
 from ..dataset.views import VolumetricView
 from ..database import db
 from ..options import config
+
+if TYPE_CHECKING:
+    from ..electrodes import ElectrodeSet
 
 
 """ --- Individual compositing functions --- """
@@ -672,3 +676,224 @@ def add_cutout(fig, name: str, dataview: HasSubject, layers=None, height=None,
     fig.set_size_inches(inch_size[0], inch_size[1])
 
     return
+
+
+#: Which matplotlib marker each electrode group type gets when none is named.
+#: Shape carries the device -- a reader should not have to consult a legend to
+#: tell a grid from a depth electrode, since the two mean quite different things
+#: about how far to trust the position drawn.
+MARKER_BY_GROUP_TYPE = {
+    "grid": "o",
+    "strip": "s",
+    "seeg": "D",
+    "depth": "D",
+}
+
+DEFAULT_MARKER = "o"
+
+
+def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLike]=None,
+                   subject: Optional[str]=None,
+                   depth: Optional[Union[float, tuple[float, float]]]=None,
+                   depth_tol: float=0.25, placeable_only: bool=True,
+                   cmap: Optional[str]=None, vmin: Optional[float]=None, vmax: Optional[float]=None,
+                   color: Optional[ColorType]=None,
+                   size: float=36.0, size_by: Optional[str]=None,
+                   size_range: tuple[float, float]=(12.0, 110.0),
+                   marker: Optional[Union[str, dict]]=None,
+                   edgecolor: ColorType="k", linewidth: float=0.5, alpha: Optional[float]=None,
+                   with_labels: bool=False, labelsize: float=6.0, labelcolor: ColorType="k",
+                   zorder: int=1001, **kwargs: Any) -> dict[str, PathCollection]:
+    """Add intracranial electrode markers to a flatmap figure.
+
+    NOTE: zorder for electrodes is 1001, above the ROI layer, so contacts stay
+    visible wherever they land.
+
+    Parameters
+    ----------
+    fig : figure or ax
+        figure into which to plot the electrodes
+    electrodes : cortex.electrodes.ElectrodeSet
+        The electrodes to draw. Anchored in place if it is not already, which
+        needs the set to know its subject.
+    values : array-like, optional
+        One value per electrode, colormapped through ``cmap``. Length must match
+        the *whole* set, before any filtering below. None draws every marker in
+        ``color``.
+    subject : str, optional
+        The subject the figure belongs to. When given, it must match the
+        electrode set's own subject. Worth passing: electrodes from the wrong
+        subject land on plausible-looking cortex and produce a figure that is
+        wrong rather than empty.
+    depth : float or (float, float), optional
+        Select on normalised cortical depth -- 0 at the pia, 1 at the white
+        matter, negative outside. A float keeps electrodes within ``depth_tol``
+        of it, a pair keeps a closed range, and None (the default) keeps
+        everything. This is the same coordinate as the webgl viewer's depth
+        slider, so a figure and a viewer can be made to agree.
+    depth_tol : float
+        Half-width of the band kept when ``depth`` is a single value.
+    placeable_only : bool
+        Drop electrodes the placement policy rejected -- those too far from any
+        cortical column to have an honest surface position. On by default; the
+        rejected ones are still in the set, so turning this off shows what was
+        excluded rather than resurrecting anything.
+    cmap : str, optional
+        Colormap for ``values``. Defaults to matplotlib's current default.
+    vmin, vmax : float, optional
+        Colormap limits. Default to the range of ``values`` after filtering.
+    color : matplotlib colorspec, optional
+        A single colour for every marker, used when ``values`` is None.
+        Defaults to white with a dark edge, which reads against both the light
+        and dark bands of a curvature background.
+    size : float
+        Marker area in points squared.
+    size_by : str, optional
+        Name of a numeric electrode field -- in practice ``"size"``, the contact
+        diameter in millimetres -- to scale markers by, mapped onto
+        ``size_range``. Overrides ``size``.
+    size_range : (float, float)
+        Smallest and largest marker area when ``size_by`` is used.
+    marker : str or dict, optional
+        A matplotlib marker for every electrode, or a dict from group type to
+        marker. None uses :data:`MARKER_BY_GROUP_TYPE`.
+    edgecolor, linewidth, alpha : optional
+        Passed through to ``scatter``.
+    with_labels : bool
+        Annotate each marker with its channel name.
+    labelsize, labelcolor : optional
+        Font size and colour for those labels.
+    zorder : int
+        Drawing order.
+
+    Returns
+    -------
+    dict of str to matplotlib.collections.PathCollection
+        One collection per marker shape drawn, keyed by the marker. They share a
+        colormap and norm, so any one of them serves as the mappable for a
+        colorbar.
+
+    Notes
+    -----
+    Markers are a constant size in figure units; they are *not* scaled by local
+    areal distortion. Flattening stretches cortex unevenly, by a factor of two
+    or three in places, so a marker drawn to cover a fixed cortical area would
+    change size across the map and invite the reader to compare sizes that mean
+    nothing. Constant size says "a contact is here" and no more, which is what a
+    contact position supports. Pass ``size_by="size"`` to encode the real
+    contact diameter deliberately.
+
+    Call this after :func:`add_cutout` if you use one. A cutout clips image
+    layers and resets the axis limits; markers outside those limits vanish with
+    it, but a marker inside the cutout's bounding box and outside its outline
+    will still be drawn.
+    """
+    from ..electrodes import ElectrodeSet  # noqa: F401  (runtime type check below)
+
+    if not isinstance(electrodes, ElectrodeSet):
+        raise TypeError(
+            "add_electrodes needs a cortex.electrodes.ElectrodeSet, got %s"
+            % type(electrodes).__name__
+        )
+    if subject is not None and electrodes.subject not in (None, subject):
+        raise ValueError(
+            "these electrodes belong to subject %r but the figure is subject %r"
+            % (electrodes.subject, subject)
+        )
+    if electrodes.anchors is None:
+        electrodes.anchor(subject=subject)
+    anchors = electrodes.anchors
+    assert anchors is not None                       # anchor() just set it
+
+    values_arr = None
+    if values is not None:
+        values_arr = np.asarray(values, dtype=np.float64).ravel()
+        if len(values_arr) != len(electrodes):
+            raise ValueError(
+                "values has %d entries but there are %d electrodes"
+                % (len(values_arr), len(electrodes))
+            )
+
+    keep = np.ones(len(electrodes), dtype=bool)
+    if placeable_only:
+        keep &= anchors.placeable
+    if depth is not None:
+        d = electrodes.depth
+        if isinstance(depth, (int, float, np.floating, np.integer)):
+            in_band = np.abs(d - float(depth)) <= depth_tol
+        else:
+            lo, hi = depth
+            in_band = (d >= lo) & (d <= hi)
+        # An electrode whose depth is unknown -- a subject with no white-matter
+        # surface -- cannot fail a depth test, so it is kept rather than
+        # silently disappearing when a depth argument is added.
+        keep &= in_band | ~np.isfinite(d)
+
+    if not keep.any():
+        return {}
+    # `select` rather than `electrodes[keep]`: indexing is overloaded to return a
+    # single ElectrodeInfo for a scalar index, so only this spelling is a set.
+    selected = electrodes.select(where=keep)
+    if values_arr is not None:
+        values_arr = values_arr[keep]
+
+    positions = selected.positions("flat", subject=subject, nudge=True)
+
+    # Colours
+    norm = None
+    if values_arr is not None:
+        from matplotlib.colors import Normalize
+        norm = Normalize(
+            vmin=np.nanmin(values_arr) if vmin is None else vmin,
+            vmax=np.nanmax(values_arr) if vmax is None else vmax,
+        )
+    elif color is None:
+        color = "white"
+
+    # Sizes
+    if size_by is not None:
+        raw = np.asarray(selected._field(size_by), dtype=np.float64)
+        finite = np.isfinite(raw)
+        sizes = np.full(len(selected), float(np.mean(size_range)))
+        if finite.any():
+            lo, hi = np.nanmin(raw[finite]), np.nanmax(raw[finite])
+            frac = np.zeros_like(raw) if hi == lo else (raw - lo) / (hi - lo)
+            sizes[finite] = size_range[0] + frac[finite] * (size_range[1] - size_range[0])
+    else:
+        sizes = np.full(len(selected), float(size))
+
+    # One scatter call per marker shape, since matplotlib takes one marker each.
+    marker_of = _electrode_markers(selected, marker)
+    _, ax = _get_fig_and_ax(fig)
+    collections: dict[str, PathCollection] = {}
+    for shape in sorted(set(marker_of)):
+        sel = marker_of == shape
+        scatter_kws = dict(
+            s=sizes[sel], marker=shape, edgecolors=edgecolor, linewidths=linewidth,
+            alpha=alpha, zorder=zorder, label="electrodes", **kwargs,
+        )
+        if values_arr is None:
+            scatter_kws["c"] = [color] * int(sel.sum())
+        else:
+            scatter_kws.update(c=values_arr[sel], cmap=cmap, norm=norm)
+        collections[shape] = ax.scatter(positions[sel, 0], positions[sel, 1], **scatter_kws)
+
+    if with_labels:
+        for i, name in enumerate(selected.names):
+            ax.annotate(str(name), (positions[i, 0], positions[i, 1]),
+                        textcoords="offset points", xytext=(4, 4),
+                        fontsize=labelsize, color=labelcolor, zorder=zorder + 1)
+
+    return collections
+
+
+def _electrode_markers(electrodes: "ElectrodeSet",
+                       marker: Optional[Union[str, dict]]) -> npt.NDArray[np.str_]:
+    """One matplotlib marker per electrode."""
+    if isinstance(marker, str):
+        return np.array([marker] * len(electrodes), dtype=object)
+    table = MARKER_BY_GROUP_TYPE if marker is None else marker
+    return np.array(
+        [table.get(str(g).lower(), DEFAULT_MARKER) for g in electrodes.group_type],
+        dtype=object,
+    )

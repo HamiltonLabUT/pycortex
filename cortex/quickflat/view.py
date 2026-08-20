@@ -4,7 +4,7 @@ import tempfile
 import binascii
 import numpy as np
 import numpy.typing as npt
-from typing import IO, BinaryIO, Mapping, Optional, Sequence, Union
+from typing import IO, TYPE_CHECKING, BinaryIO, Mapping, Optional, Sequence, Union
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -12,10 +12,14 @@ from matplotlib.typing import ColorType
 
 from . import composite
 from .. import dataset, utils
+from ..database import db
 from ..dataset.views import as_renderable
 from ..dataset.view2D import Dataview2D
 from ..dataset.views import ScalarView, VolumetricView
 from .utils import make_flatmap_image
+
+if TYPE_CHECKING:
+    from ..electrodes import ElectrodeSet
 
 
 default_colorbar_locations = {
@@ -45,7 +49,9 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
                 labelsize: Optional[str]=None, labelcolor: Optional[ColorType]=None, cutout: Optional[str]=None, curvature_brightness: Optional[float]=None,
                 curvature_contrast: Optional[float]=None, curvature_threshold: Optional[bool]=None, fig: Optional[Union[Figure, Axes]]=None, extra_hatch: Optional[tuple[dataset.Dataview, tuple[float, float, float]]]=None,
                 colorbar_ticks: Optional[npt.ArrayLike]=None, colorbar_location: Union[tuple[float, float, float, float], str]='center', roi_list: Optional[Sequence[str]]=None, sulci_list: Optional[Sequence[str]]=None,
-                nanmean: bool=False) -> Figure:
+                nanmean: bool=False, with_electrodes: Union[bool, str, "ElectrodeSet"]=False,
+                electrode_values: Optional[npt.ArrayLike]=None,
+                electrode_kwargs: Optional[dict]=None) -> Figure:
     """Show a Volume or Vertex on a flatmap with matplotlib.
 
     Parameters
@@ -75,6 +81,16 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
         of a sub-layer of the 'cutouts' layer in <filestore>/<subject>/overlays.svg
     sulci_list : list
         List of sulci to include
+    with_electrodes : bool, str or ElectrodeSet, optional
+        Draw intracranial electrodes over the flatmap. True loads the subject's
+        default set from the filestore, a string names one of several sets, and
+        an :class:`~cortex.electrodes.ElectrodeSet` is used as given. Drawn last,
+        so a cutout has already reset the axis limits.
+    electrode_values : array-like, optional
+        One value per electrode, colormapped onto the markers.
+    electrode_kwargs : dict, optional
+        Passed to :func:`cortex.quickflat.composite.add_electrodes` -- ``depth``,
+        ``marker``, ``size_by``, ``cmap`` and the rest.
 
     Other Parameters
     ----------------
@@ -235,6 +251,19 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
     # Add (apply) cutout of flatmap
     if cutout is not None:
         composite.add_cutout(ax, cutout, dataview, layers, overlay_file=overlay_file)
+
+    # Add electrodes, after the cutout: they are scatter markers rather than image
+    # layers, so `add_cutout` cannot clip them and would choke on them if they were
+    # in `layers`. Drawing them here means the cutout's axis limits clip them
+    # instead.
+    if with_electrodes is not False:
+        electrodes = with_electrodes
+        if electrodes is True or isinstance(electrodes, str):
+            name = "electrodes" if electrodes is True else electrodes
+            electrodes = db.get_electrodes(dataview.subject, name=name)
+        composite.add_electrodes(ax, electrodes, values=electrode_values,
+                                 subject=dataview.subject,
+                                 **(electrode_kwargs or {}))
 
     if with_colorbar:
         colorbar_location = _check_colorbar_location(colorbar_location)
