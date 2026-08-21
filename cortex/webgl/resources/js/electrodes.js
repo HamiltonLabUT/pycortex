@@ -13,16 +13,13 @@
 // changes to support them.
 var electrodes = (function(module) {
 
-    // Shape carries the device, so a reader can tell a grid from a depth
-    // electrode without consulting a legend -- and the two mean quite different
-    // things about how far to trust the position drawn. Deliberately the same
-    // vocabulary quickflat's add_electrodes uses: circle, square, diamond.
-    module.SHAPES = {
-        grid:  "sphere",
-        strip: "cube",
-        seeg:  "diamond",
-        depth: "diamond",
-    };
+    // Per-device-type shape overrides. Empty by default: every contact is a
+    // sphere, because that is what an electrode contact is, and shape-coding
+    // the device type is a decision the caller should make deliberately rather
+    // than inherit. Fill this in for e.g.
+    // {grid: "sphere", strip: "cube", seeg: "diamond"}.
+    module.SHAPES = {};
+
     module.DEFAULT_SHAPE = "sphere";
 
     module.makeGeometries = function(radius) {
