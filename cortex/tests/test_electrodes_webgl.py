@@ -177,6 +177,17 @@ class TestMarkersInTheViewer:
         # A 64-contact grid at 8 mm pitch spans well under half a hemisphere.
         assert extent.max() < 90.0
 
+    def test_at_unfold_zero_markers_sit_at_their_true_coordinates(self):
+        """On the anatomical surface the measured coordinate is the truth.
+
+        A depth contact belongs inside the brain; snapping it to the nearest
+        gyrus would draw a position it does not have. The anchor only takes
+        over once the surface deforms and the coordinate stops meaning
+        anything.
+        """
+        drawn = np.array([c["position"] for c in type(self).reported])
+        assert np.allclose(drawn, type(self).eset.coords, atol=1e-3)
+
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
                   if "[pageerror]" in e]

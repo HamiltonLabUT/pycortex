@@ -125,6 +125,11 @@ def to_viewer_json(
             "group": str(eset.group[i]),
             "group_type": str(eset.group_type[i]).lower(),
             "hemi": _VIEWER_HEMI[hemi],
+            # The measured TkRegRAS position, sent alongside the anchor. The
+            # viewer shows this one on the anatomical surface -- where a
+            # coordinate is still meaningful -- and crosses over to the anchor
+            # as soon as the surface starts to deform.
+            "coords": [float(x) for x in eset.coords[i]],
             "verts": _ctm_verts(anchors.verts[i], hemi, ctm_index, left_nverts),
             "weights": [float(w) for w in anchors.weights[i]],
             "depth": _finite(anchors.depth[i]),

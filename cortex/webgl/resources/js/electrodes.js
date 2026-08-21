@@ -38,6 +38,7 @@ var electrodes = (function(module) {
         this.posdata = posdata;
         this.radius = json.radius === undefined ? 1.5 : json.radius;
         this.lift = json.lift === undefined ? 1.0 : json.lift;
+        this._raw = new THREE.Vector3();   // scratch, reused every frame
         this._visible = true;
 
         this.markers = {left:new THREE.Group(), right:new THREE.Group()};
@@ -80,6 +81,7 @@ var electrodes = (function(module) {
 
             this.contacts.push({
                 hemi:       contact.hemi,
+                coords:     contact.coords,
                 verts:      verts,
                 rawVerts:   [contact.verts[0], contact.verts[1], contact.verts[2]],
                 weights:    contact.weights,
@@ -101,9 +103,33 @@ var electrodes = (function(module) {
 
     // Re-place every marker for the current inflation and depth. Called on each
     // "mix" event, which the surface dispatches whenever either changes.
+    //
+    // Two regimes, because an electrode has two positions and only one of them
+    // is true at a time. On the anatomical surface the contact's measured
+    // TkRegRAS coordinate is exactly right, and it should be drawn there
+    // whether or not that puts it on the cortex -- a depth contact belongs
+    // inside the brain, and snapping it to a gyrus would be a lie. Once the
+    // surface starts to deform, that coordinate means nothing, and the anchor
+    // is all that is left. So: true coordinate at surfmix 0, anchored position
+    // by the time the first morph target is reached, linear in between.
     module.Electrodes.prototype.setMix = function(evt) {
+        var morphs = this.surf.names.length - 1;
+        var t = Math.max(0, Math.min(1, evt.mix * morphs));
+
         for (var i = 0; i < this.contacts.length; i++) {
             var contact = this.contacts[i];
+
+            if (t < 1) {
+                // The browser's base surface is the pia in its original
+                // coordinates, so a TkRegRAS point drops straight into the
+                // same frame with no conversion.
+                this._raw.fromArray(contact.coords);
+            }
+            if (t <= 0) {
+                contact.mesh.position.copy(this._raw);
+                continue;
+            }
+
             var vert = mriview.get_position_bary(
                 this.posdata[contact.hemi], evt.mix, evt.thickmix,
                 contact.verts, contact.weights
@@ -113,7 +139,9 @@ var electrodes = (function(module) {
             vert.pos.add(
                 vert.norm.normalize().multiplyScalar(this.radius * this.lift)
             );
-            contact.mesh.position.copy(vert.pos);
+            contact.mesh.position.copy(
+                t >= 1 ? vert.pos : this._raw.lerp(vert.pos, t)
+            );
         }
     }
 
