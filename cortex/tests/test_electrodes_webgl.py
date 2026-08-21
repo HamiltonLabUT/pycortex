@@ -233,6 +233,32 @@ class TestMarkersInTheViewer:
         e.setLabels(False)
         time.sleep(0.5)
 
+    def test_hovering_a_contact_shows_that_one_label(self):
+        """Hover works with the global labels toggle off, one at a time.
+
+        Aimed by projecting a contact to screen coordinates and hit-testing
+        there, so this exercises the real raycast rather than poking the
+        hovered contact in directly.
+        """
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def unwrap(v):
+            # The python bridge returns every value wrapped in a one-element
+            # list, and nests that wrapping for arrays. Peel until it is not a
+            # singleton -- a genuine [x, y] pair has length two and survives.
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        xy = unwrap(e.projectContact(0))
+        name = unwrap(e.pickNameAt(xy[0], xy[1]))
+        assert name, "raycast found nothing where a contact was projected"
+
+        assert unwrap(e.hoverAt(xy[0], xy[1])) == name
+        time.sleep(0.5)
+        # ...and pointing at empty space clears it.
+        assert unwrap(e.hoverAt(-0.98, -0.98)) == ""
+
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
                   if "[pageerror]" in e]

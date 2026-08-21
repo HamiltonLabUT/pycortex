@@ -98,6 +98,7 @@ var electrodes = (function(module) {
         }
 
         this._buildLabels();
+        this._bindHover();
 
         this.ui = (new jsplot.Menu()).add({
             visible: {action:[this, "setVisible"]},
@@ -251,6 +252,94 @@ var electrodes = (function(module) {
         }
     };
 
+    // -- hover ---------------------------------------------------------------
+    //
+    // Raycast against the marker meshes on mousemove and show that one
+    // contact's label. The viewer's own picker cannot help here: it resolves a
+    // *vertex* by rendering the surface to an offscreen buffer and reading back
+    // an encoded index, and electrodes are separate meshes that never appear in
+    // that buffer.
+    //
+    // Reuses the label sprites rather than adding a DOM tooltip, so a hovered
+    // name looks identical to a pinned one and the two can coexist: with the
+    // labels toggle off you get one at a time, with it on the hovered one is
+    // already shown.
+    module.Electrodes.prototype._bindHover = function() {
+        this._ray = new THREE.Raycaster();
+        this._hovered = null;
+
+        $("#brain").on("mousemove.electrodes", function(evt) {
+            var el = $("#brain"), off = el.offset();
+            var hit = this._pickNDC(
+                ((evt.pageX - off.left) / el.width()) * 2 - 1,
+                -((evt.pageY - off.top) / el.height()) * 2 + 1
+            );
+            if (hit === this._hovered)
+                return;                     // nothing changed; don't redraw
+            this._hovered = hit;
+            this._placeLabels();
+            if (typeof viewer !== "undefined" && viewer.schedule !== undefined)
+                viewer.schedule();
+        }.bind(this));
+    };
+
+    // Takes normalised device coordinates rather than an event, so the hit test
+    // can be driven from anywhere -- a mouse handler, or a test that knows
+    // where a contact projects to.
+    module.Electrodes.prototype._pickNDC = function(x, y) {
+        if (!this._visible || typeof viewer === "undefined" || viewer.camera === undefined)
+            return null;
+
+        // r69 has no Raycaster.setFromCamera, so unproject a point on the far
+        // plane and aim the ray at it by hand.
+        var target = new THREE.Vector3(x, y, 0.5);
+        target.unproject(viewer.camera);
+        this._ray.set(viewer.camera.position,
+                      target.sub(viewer.camera.position).normalize());
+
+        var meshes = [];
+        for (var i = 0; i < this.contacts.length; i++)
+            if (this.contacts[i].mesh.visible)
+                meshes.push(this.contacts[i].mesh);
+
+        var hits = this._ray.intersectObjects(meshes);
+        if (!hits.length)
+            return null;
+        for (var i = 0; i < this.contacts.length; i++)
+            if (this.contacts[i].mesh === hits[0].object)
+                return this.contacts[i];
+        return null;
+    };
+
+    // Where a contact lands on screen, in the same normalised coordinates
+    // _pickNDC takes. Exists so the hit test can be exercised without
+    // synthesising DOM events.
+    module.Electrodes.prototype.projectContact = function(i) {
+        var mesh = this.contacts[i].mesh;
+        mesh.updateMatrixWorld();
+        var p = new THREE.Vector3().setFromMatrixPosition(mesh.matrixWorld);
+        p.project(viewer.camera);
+        return [p.x, p.y];
+    };
+
+    // The name under those coordinates, or "" -- a plain value, so it survives
+    // the trip across the python bridge.
+    module.Electrodes.prototype.pickNameAt = function(x, y) {
+        var hit = this._pickNDC(x, y);
+        return hit === null ? "" : hit.name;
+    };
+
+    // Set the hover from normalised coordinates, as a mousemove would.
+    module.Electrodes.prototype.hoverAt = function(x, y) {
+        this._hovered = this._pickNDC(x, y);
+        this._placeLabels();
+        return this.hovered();
+    };
+
+    module.Electrodes.prototype.hovered = function() {
+        return this._hovered === null ? "" : this._hovered.name;
+    };
+
     module.Electrodes.prototype.setLabels = function(val) {
         if (val === undefined)
             return !!this._labelsOn;
@@ -268,7 +357,8 @@ var electrodes = (function(module) {
             var contact = this.contacts[i];
             contact.label.position.copy(contact.mesh.position);
             contact.label.position.z += this.radius * 2.5;
-            contact.label.visible = !!this._labelsOn && contact.mesh.visible;
+            contact.label.visible = contact.mesh.visible
+                && (!!this._labelsOn || contact === this._hovered);
         }
     };
 
