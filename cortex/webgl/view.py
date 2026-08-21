@@ -237,6 +237,12 @@ def make_static(
     ctms = dict((subj, utils.get_ctmpack(subj, types, **ctmargs)) for subj in subjects)
     package.reorder(ctms)
 
+    # Serialise the electrodes here, while `ctms` still holds real paths on disk:
+    # the anonymisation below rewrites every value to a bundle-relative name and,
+    # with `anonymize`, renames the keys too, so the CTM's vertex permutation
+    # would be unreachable by the time the viewopts are assembled.
+    electrode_viewopts = _electrode_viewopts(electrodes, ctms)
+
     db.auxfile = None
 
     ## Rename files to anonymize
@@ -311,7 +317,7 @@ def make_static(
     my_viewopts: dict[str, Any] = dict(options.config.items("webgl_viewopts"))
     my_viewopts["overlays_visible"] = overlays_visible
     my_viewopts["labels_visible"] = labels_visible
-    my_viewopts["electrodes"] = _electrode_viewopts(electrodes, ctms)
+    my_viewopts["electrodes"] = electrode_viewopts
     my_viewopts["brightness"] = (
         options.config.get("curvature", "brightness")
         if curvature_brightness is None

@@ -115,6 +115,23 @@ def test_serialisation_needs_anchors():
         to_viewer_json(eset)
 
 
+def test_make_static_embeds_the_electrodes(tmp_path):
+    """`make_static` rewrites its `ctms` values to bundle-relative names, and
+    under `anonymize` renames the keys too, so the electrode payload has to be
+    built before that happens or the CTM permutation is unreachable. Only the
+    static path exercises this -- `show` keeps real paths throughout."""
+    eset = build_grid()
+    out = str(tmp_path / "bundle")
+    cortex.webgl.make_static(out, cortex.Vertex.random(SUBJECT),
+                             electrodes=eset, overlays_visible=())
+
+    with open(os.path.join(out, "index.html")) as page:
+        html = page.read()
+    assert "electrodes.Electrodes" in html            # the module was inlined
+    assert '"electrodes"' in html                     # ...and given a payload
+    assert eset.names[0] in html                      # ...naming real contacts
+
+
 # -- the browser half ------------------------------------------------------
 
 @pytest.mark.skipif(not has_playwright, reason="playwright and chromium are required")
