@@ -1,16 +1,17 @@
-"""Contains classes for representing brain data in either volumetric or vertex
-(surface-based) formats for visualization.
+"""Classes representing brain data -- volumetric, per-vertex, or per-electrode --
+for visualization.
 
-The six public view classes form a 2x3 grid: two spaces (volumetric, surface)
-crossed with three channel layouts (scalar + 1D colormap, two channels + 2D
-colormap, three channels + alpha).
+The nine public view classes form a 3x3 grid: three spaces (volumetric,
+surface, electrode) crossed with three channel layouts (scalar + 1D colormap,
+two channels + 2D colormap, three channels + alpha).
 
-===========  ===============  ===============  ===============
-space        scalar           2D               RGB
-===========  ===============  ===============  ===============
-volumetric   :class:`Volume`  :class:`Volume2D`  :class:`VolumeRGB`
-surface      :class:`Vertex`  :class:`Vertex2D`  :class:`VertexRGB`
-===========  ===============  ===============  ===============
+===========  ==================  ====================  ====================
+space        scalar              2D                    RGB
+===========  ==================  ====================  ====================
+volumetric   :class:`Volume`     :class:`Volume2D`     :class:`VolumeRGB`
+surface      :class:`Vertex`     :class:`Vertex2D`     :class:`VertexRGB`
+electrode    :class:`Electrode`  :class:`Electrode2D`  :class:`ElectrodeRGB`
+===========  ==================  ====================  ====================
 
 The channel layout is the inheritance axis: :class:`Dataview` is the common
 root, and :class:`ScalarView`, :class:`Dataview2D` and :class:`DataviewRGB` sit
@@ -36,6 +37,7 @@ from .views import (  # isort: skip
     Packable,
     RenderableView,
     ScalarView,
+    ElectrodeView,
     SurfaceView,
     as_renderable,
     Vertex,
@@ -50,20 +52,25 @@ from ._space import (
     register_space,
     registered_spaces,
 )
-from ._webgl import MosaicTexture, VertexAttributes, WebGLPayload
+from ._electrode_space import ElectrodeSpace
+from .electrode_views import Electrode, Electrode2D, ElectrodeRGB
+from ._webgl import ElectrodeValues, MosaicTexture, VertexAttributes, WebGLPayload
 from .braindata import BrainData, VertexData, VolumeData
 from .dataset import Dataset, DatasetLike, normalize
 from .view2D import Dataview2D, Vertex2D, Volume2D
 from .viewRGB import Colors, DataviewRGB, VertexRGB, VolumeRGB
 
 __all__ = [
-    # the six public view classes
+    # the nine public view classes
     "Volume",
     "Vertex",
+    "Electrode",
     "Volume2D",
     "Vertex2D",
+    "Electrode2D",
     "VolumeRGB",
     "VertexRGB",
+    "ElectrodeRGB",
     # containers and helpers
     "Dataset",
     "DatasetLike",
@@ -83,15 +90,18 @@ __all__ = [
     "BrainSpace",
     "VolumeSpace",
     "SurfaceSpace",
+    "ElectrodeSpace",
     "register_space",
     "registered_spaces",
-    # the two webgl wire encodings a space can pack its arrays into
+    # the webgl wire encodings a space can pack its arrays into
     "WebGLPayload",
     "MosaicTexture",
     "VertexAttributes",
+    "ElectrodeValues",
     # the spatial axis of the grid, and helpers for narrowing it
     "VolumetricView",
     "SurfaceView",
+    "ElectrodeView",
     "RenderableView",
     "HasSubject",
     "as_renderable",

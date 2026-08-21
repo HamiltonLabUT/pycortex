@@ -521,11 +521,15 @@ def test_a_third_space_registers_ahead_of_the_catch_all():
     from cortex.dataset import _space as space_mod
     from cortex.dataset._space import SurfaceSpace, VolumeSpace
 
-    # only the catch-all declares itself one, and the built-in order is unchanged
+    # exactly one catch-all, and it sorts last however many spaces ship. That is
+    # the invariant; the built-in list itself grows -- ElectrodeSpace is the
+    # first space added through ADDING_A_SPACE.md, and it landed here by
+    # registering rather than by anyone editing this order.
     assert SurfaceSpace.fallback and not VolumeSpace.fallback
-    assert [c.__name__ for c in space_mod.registered_spaces()] == [
-        "VolumeSpace",
-        "SurfaceSpace",
+    builtin = [c.__name__ for c in space_mod.registered_spaces()]
+    assert builtin[0] == "VolumeSpace" and builtin[-1] == "SurfaceSpace"
+    assert [c.__name__ for c in space_mod.registered_spaces() if c.fallback] == [
+        "SurfaceSpace"
     ]
 
     MySpace = _third_space_family()[0]
@@ -534,7 +538,7 @@ def test_a_third_space_registers_ahead_of_the_catch_all():
     try:
         space_mod.register_space(MySpace)
         after = [c.__name__ for c in space_mod.registered_spaces()]
-        assert after == ["VolumeSpace", "MySpace", "SurfaceSpace"]
+        assert after == builtin[:-1] + ["MySpace", "SurfaceSpace"]
 
         # so the new space claims its own node, rather than the catch-all doing it
         claimed = None

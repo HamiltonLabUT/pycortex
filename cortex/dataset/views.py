@@ -73,8 +73,9 @@ class DataviewJSON(TypedDict, total=False):
 
     Every key is optional because which ones are present depends on the view
     kind and on ``simple=``. The JS dispatches on the *shape* of these values --
-    ``mosaic`` absent means surface data, a nested list in ``data`` means a 2D
-    view, ``raw`` true means 4-channel uint8 -- so the shapes are load-bearing.
+    ``mosaic`` absent means volumetric data, ``nelec`` present means electrode
+    data, a nested list in ``data`` means a 2D view, ``raw`` true means
+    4-channel uint8 -- so the shapes are load-bearing.
     """
 
     state: Any
@@ -94,6 +95,10 @@ class DataviewJSON(TypedDict, total=False):
     xfm: list[Any]
     split: int
     frames: int
+    #: Contact count, on an electrode view. Also what ``dataset.js`` dispatches
+    #: on to choose the electrode payload class, so it must be absent from every
+    #: other kind -- the JS tests for ``undefined``.
+    nelec: int
 
 
 def _json_default(obj: Any) -> Any:
@@ -655,9 +660,44 @@ class SurfaceView(RenderableView):
         ):
             chan = getattr(blended, channel)
             chan.data = (chan.data * clipped + (1 - clipped) * curv.data).astype("uint8")
-    
+
         return blended
 
+
+class ElectrodeView(RenderableView):
+    """A view whose data sits on intracranial contacts rather than on the cortex.
+
+    The third spatial interface, and the first added since the two above -- so it
+    is also the demonstration that the axis is open. See :class:`VolumetricView`
+    for why these are abstract bases rather than ``Protocol``\\ s.
+
+    What makes it a distinct kind is that its array is indexed by *contact*, not
+    by any part of the anatomy. There are typically a few hundred entries where a
+    surface has a few hundred thousand, and no contact corresponds to a vertex:
+    each one carries a barycentric anchor to three of them, which is what lets a
+    marker follow the surface as it inflates. So an electrode view is drawn as
+    markers over somebody else's picture of the brain, never as an image layer of
+    its own, and passing one where a per-vertex array is expected would index the
+    flatmap cache with a few hundred values and fail. ``quickflat`` therefore
+    tests for this class explicitly rather than sampling it.
+    """
+
+    @property
+    def contacts(self) -> npt.NDArray:
+        """The data per contact, with a leading time axis.
+
+        The electrode name for :attr:`RenderableView.renderer_data`, alongside
+        :attr:`VolumetricView.volume` and :attr:`SurfaceView.vertices`: scalar for
+        :class:`~cortex.dataset.electrode_views.Electrode`, uint8 RGBA for the 2D
+        and RGB views, whose data has already been colormapped.
+        """
+        return self.renderer_data
+
+    @property
+    @abstractmethod
+    def raw(self) -> ElectrodeRGB:
+        """Narrowed from :attr:`Dataview.raw`: an electrode view renders to
+        :class:`~cortex.dataset.electrode_views.ElectrodeRGB`."""
 
 
 #: The scalar view type a composite view's channels have. Covariant, because the
@@ -1538,7 +1578,7 @@ class _masker(Generic[T_masker]):
 # factories
 # ----------------------------------------------------------------------
 @overload
-def normalize(data: tuple[Any, Any, Any]) -> Union[Volume, VolumeRGB]: ...
+def normalize(data: tuple[Any, Any, Any]) -> Union[Volume, VolumeRGB, Electrode]: ...
 
 
 @overload
@@ -1551,9 +1591,20 @@ def normalize(data: Dataview) -> Dataview: ...
 
 def normalize(
     data: Union[Dataview, tuple],
-) -> Union[Volume, VolumeRGB, Vertex, Dataview]:
+) -> Union[Volume, VolumeRGB, Vertex, Electrode, Dataview]:
     if isinstance(data, tuple):
         if len(data) == 3:
+            # An electrode tuple is recognised by carrying the set itself, not
+            # by carrying a montage *name*: a name is a string and so is an
+            # xfmname, which would make `(arr, "S1", "native")` ambiguous with
+            # the volume form. There is no way to tell those apart, so this
+            # shorthand takes the one third element that can only mean one
+            # thing, and anything else is spelled `cortex.Electrode(...)`.
+            from ..electrodes import ElectrodeSet
+
+            if isinstance(data[2], ElectrodeSet):
+                array, subject, eset = data
+                return Electrode(array, subject, electrodes=eset)
             if data[0].dtype == np.uint8:
                 return VolumeRGB(
                     data[0][..., 0], data[0][..., 1], data[0][..., 2], *data[1:]
@@ -1729,3 +1780,4 @@ def _from_hdf_view(
 
 from .viewRGB import Colors, DataviewRGB, VertexRGB, VolumeRGB  # noqa: E402
 from .view2D import Dataview2D, Vertex2D, Volume2D  # noqa: E402
+from .electrode_views import Electrode, Electrode2D, ElectrodeRGB  # noqa: E402

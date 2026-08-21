@@ -128,6 +128,47 @@ class VertexAttributes(WebGLPayload):
         return [buf.read()]
 
 
+class ElectrodeValues(WebGLPayload):
+    """Electrode encoding: one value per contact per frame, as ``.npy`` bytes.
+
+    The third encoding, and deliberately the plainest of the three. Both older
+    ones do something to the array on the way out that would be wrong here:
+    :class:`MosaicTexture` tiles a 3-D grid into images, and
+    :class:`VertexAttributes` permutes into the CTM's vertex order and
+    premultiplies alpha. An array indexed by *contact* has no vertex order to be
+    permuted into, and its values are read by JavaScript to look a colour up
+    rather than by a shader to composite one, so neither applies.
+
+    Serialising still happens in :meth:`reorder` rather than in ``__init__``,
+    because that is the phase ``webgl/data.py`` turns frames into bytes in --
+    the hook is named for what the per-vertex encoding uses it for, not for what
+    it is.
+    """
+
+    def __init__(self, data: npt.NDArray, *, raw: bool) -> None:
+        self.raw = raw
+        self.frames = [data.astype(np.uint8 if raw else np.float32)]
+
+    def describe(self) -> dict[str, Any]:
+        # No `mosaic`, and no `nelec` either: that one is the space's, from
+        # `describe_layout`, since it describes the montage rather than the
+        # encoding. `dataset.js` dispatches on it.
+        return {"raw": self.raw}
+
+    def reorder(self, frames: list[Any], vertex_index: Any) -> list[Any]:
+        """The frames as ``.npy`` bytes, in the order they were given.
+
+        ``vertex_index`` is ignored, as the signature's default does -- but the
+        serialisation is not, which is why this is overridden rather than
+        inherited. Leaving the default in place would ship a numpy array where
+        the server expects bytes.
+        """
+        buf = BytesIO()
+        np.save(buf, np.ascontiguousarray(np.asarray(frames)[0]))
+        buf.seek(0)
+        return [buf.read()]
+
+
 def pack_png(tile: npt.NDArray) -> bytes:
     """One mosaic tile as PNG bytes."""
     from PIL import Image
