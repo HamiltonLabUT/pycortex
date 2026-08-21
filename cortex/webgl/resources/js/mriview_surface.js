@@ -511,7 +511,19 @@ var mriview = (function(module) {
             }
 
             this.picker.apply(dataview)
+            // Electrode data colours the markers rather than the cortex, so it
+            // has to be handed over here as well as to the shaders above.
+            // Anything else unbinds them, back to their flat colour.
+            if (this.electrodes !== undefined)
+                this.electrodes.setDataView(dataview);
         }.bind(this));
+    };
+
+    // Recolour the markers for a change that did not switch dataset -- a
+    // vmin/vmax slider, a colormap, a movie frame.
+    module.Surface.prototype.refreshElectrodes = function() {
+        if (this.electrodes !== undefined)
+            this.electrodes.setValues();
     };
 
     module.Surface.prototype.resetShaders = function() {
@@ -836,6 +848,9 @@ var mriview = (function(module) {
     }
     module.SurfDelegate.prototype.apply = function(dataview) {
         return this.surf.apply(dataview);
+    }
+    module.SurfDelegate.prototype.refreshElectrodes = function() {
+        return this.surf.refreshElectrodes();
     }
     module.SurfDelegate.prototype.resize = function(evt) {
         return this.surf.resize(evt);

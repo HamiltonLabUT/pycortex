@@ -76,7 +76,12 @@ var electrodes = (function(module) {
                 map[contact.verts[0]], map[contact.verts[1]], map[contact.verts[2]],
             ];
             var shape = module.SHAPES[contact.group_type] || module.DEFAULT_SHAPE;
-            var mesh = new THREE.Mesh(this.geometries[shape], this.material);
+            // One material per contact rather than the shared one, so a contact
+            // can take its own colour from data. They all start as copies of
+            // the flat colour, so a page with no electrode data looks exactly as
+            // it did before -- at the cost of one small material each, which for
+            // a few hundred contacts is nothing.
+            var mesh = new THREE.Mesh(this.geometries[shape], this.material.clone());
             mesh.name = contact.name;
             this.markers[contact.hemi].add(mesh);
 
@@ -197,8 +202,110 @@ var electrodes = (function(module) {
             return !this.material.depthTest;
         this.material.depthTest = !val;
         this.material.needsUpdate = true;
-        for (var i = 0; i < this.contacts.length; i++)
-            this.contacts[i].mesh.renderOrder = val ? 999 : 0;
+        for (var i = 0; i < this.contacts.length; i++) {
+            var mesh = this.contacts[i].mesh;
+            mesh.material.depthTest = !val;
+            mesh.material.needsUpdate = true;
+            mesh.renderOrder = val ? 999 : 0;
+        }
+    };
+
+    // -- colour from data ---------------------------------------------------
+    //
+    // The colour is looked up on the CPU rather than sampled in a shader. The
+    // viewer already loads every colormap as an <img>, so one drawImage into an
+    // offscreen canvas gives the same 256 (or 256x256) texels the shader would
+    // read, and for a few hundred contacts indexing that in JavaScript costs
+    // nothing measurable. It also keeps the markers on the plain unlit material
+    // they already use, instead of a ShaderMaterial that would have to
+    // reimplement the depth-window fade and the x-ray mode.
+    //
+    // What matters is that the answer tracks the same three things the surface's
+    // colours do -- the colormap, the vmin/vmax sliders and the movie frame --
+    // and it does, because all three are read from the active DataView here and
+    // this runs again whenever any of them changes.
+
+    var _cmapCache = {};
+
+    function _cmapPixels(texture) {
+        // A colormap texture's <img>, rasterised once and kept. Keyed on the
+        // image's own src, since the same colormap is one shared texture.
+        if (texture === undefined || texture === null || !texture.image)
+            return null;
+        var img = texture.image;
+        if (!img.complete || !img.width)
+            return null;
+        var key = img.currentSrc || img.src;
+        if (_cmapCache[key] !== undefined)
+            return _cmapCache[key];
+
+        var canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        var ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        var out;
+        try {
+            out = {
+                data: ctx.getImageData(0, 0, img.width, img.height).data,
+                width: img.width,
+                height: img.height,
+            };
+        } catch (e) {
+            out = null;      // a tainted canvas; fall back to the flat colour
+        }
+        _cmapCache[key] = out;
+        return out;
+    }
+
+    // Bind the dataview whose values colour these markers. Null unbinds, which
+    // is what a volumetric or surface dataset does -- those say nothing about
+    // electrodes, so the markers go back to their flat colour.
+    module.Electrodes.prototype.setDataView = function(dataview) {
+        this.dataview = (dataview && dataview.electrode) ? dataview : null;
+        this.setValues();
+    };
+
+    // Recolour every contact from the bound dataview's current frame. Cheap
+    // enough to call on any change rather than working out which changed.
+    module.Electrodes.prototype.setValues = function() {
+        var view = this.dataview;
+        var values = view === null ? null : view.electrodeValues();
+        var pixels = view === null ? null : _cmapPixels(view.cmap[0].value);
+
+        if (values === null || pixels === null) {
+            for (var i = 0; i < this.contacts.length; i++)
+                this.contacts[i].mesh.material.color.copy(this.material.color);
+            this.surf.dispatchEvent({type:"update"});
+            return;
+        }
+
+        var vmin = view.vmin[0].value[0], vmax = view.vmax[0].value[0];
+        var span = vmax - vmin;
+        // A 1-D colormap is one row; a 2-D one is a square, and a scalar view
+        // read against it should walk its diagonal-free bottom row, which is
+        // what the shader does for a single channel.
+        var row = (pixels.height - 1) * pixels.width * 4;
+        var last = pixels.width - 1;
+
+        for (var i = 0; i < this.contacts.length; i++) {
+            var mat = this.contacts[i].mesh.material;
+            var v = i < values.length ? values[i] : NaN;
+            if (isNaN(v)) {
+                // No value for this contact -- a NaN in the data, or a montage
+                // longer than the array. Grey says "not measured" rather than
+                // borrowing whatever colour zero happens to have.
+                mat.color.setRGB(0.5, 0.5, 0.5);
+                continue;
+            }
+            var frac = span === 0 ? 0.5 : (v - vmin) / span;
+            frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
+            var o = row + Math.round(frac * last) * 4;
+            mat.color.setRGB(
+                pixels.data[o] / 255, pixels.data[o + 1] / 255, pixels.data[o + 2] / 255
+            );
+        }
+        this.surf.dispatchEvent({type:"update"});
     };
 
     // -- channel-name labels ------------------------------------------------
@@ -409,6 +516,7 @@ var electrodes = (function(module) {
                 group_type: contact.group_type, hemi: contact.hemi,
                 depth: contact.depth, shape: contact.shape,
                 visible: contact.mesh.visible,
+                color: contact.mesh.material.color.getHex(),
                 verts: contact.verts, weights: contact.weights,
                 position: contact.mesh.position.toArray(),
             };

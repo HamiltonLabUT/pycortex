@@ -15,12 +15,23 @@ var dataset = (function(module) {
 
     module.brains = {}; //Singleton containing all BrainData objects
 
+    // Which payload class a data record wants. Three kinds now, so this is a
+    // lookup rather than the two-way `mosaic === undefined` test it grew from --
+    // that test was also made a second time in DataView, to pick the shader, and
+    // a third kind cannot be bolted onto either copy without them disagreeing.
+    // Each key must be emitted by exactly one space's describe_layout/describe.
+    module.payloadClass = function(json) {
+        if (json.nelec !== undefined)
+            return module.ElectrodeData;
+        if (json.mosaic === undefined)
+            return module.VertexData;
+        return module.VolumeData;
+    }
+
     module.fromJSON = function(dataset) {
         for (var name in dataset.data) {
-            if (dataset.data[name].mosaic === undefined)
-                module.brains[name] = new module.VertexData(dataset.data[name], dataset.images);
-            else
-                module.brains[name] = new module.VolumeData(dataset.data[name], dataset.images);
+            var cls = module.payloadClass(dataset.data[name]);
+            module.brains[name] = new cls(dataset.data[name], dataset.images);
         }
         var dataviews = [];
         for (var i = 0; i < dataset.views.length; i++) {
@@ -63,7 +74,15 @@ var dataset = (function(module) {
         this.description = json.desc;
         this.frames = this.data[0].frames;
         this.length = this.frames / this.rate;
-        this.vertex = this.data[0].mosaic === undefined;
+        // "volume", "vertex" or "electrode", declared by the payload class
+        // rather than re-derived from the JSON here.
+        this.kind = this.data[0].kind;
+        this.electrode = this.kind === "electrode";
+        // Electrode data takes the per-vertex shader path even though it has no
+        // per-vertex array: the surface's data attributes are initialised empty
+        // and never written, so `nanmask` reads 0 and the shader discards the
+        // data layer, leaving the curvature to show under the markers.
+        this.vertex = this.kind !== "volume";
         this.frame = 0;
 
         this.attrs = json.attrs;
@@ -218,7 +237,21 @@ var dataset = (function(module) {
         }
     }
     module.DataView.prototype.setColormap = function(cmap) {
+        this.cmapName = cmap;
         this.cmap[0].value = colormaps[cmap];
+    }
+
+    // The per-contact values for one frame, or null if this view has none.
+    // Read by electrodes.js, which colours its markers with them.
+    module.DataView.prototype.electrodeValues = function(frame) {
+        if (!this.electrode)
+            return null;
+        var values = this.data[0].values;
+        if (!values.length)
+            return null;
+        if (frame === undefined)
+            frame = this.frame;
+        return values[Math.floor(frame).mod(values.length)];
     }
 
     module.DataView.prototype.getShader = function(shaderfunc, uniforms, opts) {
@@ -504,6 +537,52 @@ var dataset = (function(module) {
         // The combined nanmask is dispatched by DataView.setFrame after
         // every dim's data has been set, so we don't dispatch it here.
     }
+
+    // One value per contact per frame, served as a plain .npy. No hemisphere
+    // split and no index remapping: an electrode array is indexed by contact,
+    // and a contact is not a vertex -- it carries a barycentric anchor to three
+    // of them, which electrodes.js already resolved when it placed the markers.
+    module.ElectrodeData = function(json, images) {
+        this.loaded = $.Deferred();
+        this.subject = json.subject;
+        this.movie = json.frames > 1;
+        this.raw = json.raw;
+        this.min = json.min;
+        this.max = json.max;
+        this.name = json.name;
+        this.nelec = json.nelec;
+        this.frames = json.frames;
+        this.data = images[json.name];
+
+        this.values = [];
+        // Empty on purpose, and read by DataView.setFrame: there is no
+        // per-vertex array here, so there is no NaN mask over one either.
+        this.nanmasks = [];
+
+        NParray.fromURL(this.data[0], function(array) {
+            array.loaded.progress(function(available) {
+                this.values.push(array.view(available - 1).data);
+                this.loaded.notify(available);
+            }.bind(this)).done(function() {
+                this.loaded.resolve();
+            }.bind(this));
+        }.bind(this));
+    }
+    module.ElectrodeData.prototype.kind = "electrode";
+    module.ElectrodeData.prototype.init = function(uniforms, dim) {
+        //nothing to set: the surface draws no data for this kind
+    }
+    module.ElectrodeData.prototype.setFilter = function(interp) {
+        //nothing to do: markers are geometry, not a sampled texture
+    }
+    module.ElectrodeData.prototype.set = function(uniforms, dim, fframe, dispatch) {
+        // Deliberately dispatches no "attribute" event. The surface's data
+        // attributes stay empty, which is what leaves the cortex showing its
+        // curvature while the markers carry the values.
+    }
+
+    module.VolumeData.prototype.kind = "volume";
+    module.VertexData.prototype.kind = "vertex";
 
     return module;
 }(dataset || {}));

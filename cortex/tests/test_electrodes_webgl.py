@@ -282,3 +282,216 @@ class TestMarkersInTheViewer:
                 break
             time.sleep(0.1)
         assert os.path.getsize(out) > 0
+
+
+# -- markers coloured from data --------------------------------------------
+#
+# Colour is asserted on pixels rather than on `describe()`, because a colour
+# that never reaches the framebuffer is not a colour. A screenshot also catches
+# the failure this whole file exists for -- markers drawn somewhere plausible
+# but wrong -- in the one case where the grid is easiest to read.
+#
+# The markers are found by saturation: the cortex renders as grey and the page
+# background is white, so anything with a spread between its RGB channels is a
+# marker. That holds for every colormap the viewer ships except a greyscale one.
+
+
+def _marker_pixels(path):
+    from PIL import Image
+
+    img = np.asarray(Image.open(path).convert("RGB"), dtype=int)
+    return img[(img.max(2) - img.min(2)) > 40]
+
+
+@pytest.mark.skipif(not has_playwright, reason="playwright and chromium are required")
+class TestMarkerColoursFollowTheData:
+    """One headless session showing an Electrode movie, several assertions."""
+
+    @classmethod
+    def _shot(cls, name):
+        out = os.path.join(cls.tmpdir, name)
+        if os.path.exists(out):
+            os.remove(out)
+        cls.handle.getImage(out, (700, 550))
+        for _ in range(300):
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                break
+            time.sleep(0.1)
+        time.sleep(0.3)
+        return _marker_pixels(out)
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _viewer(self, request, tmp_path_factory):
+        from cortex.export.save_views import angle_view_params, default_view_params
+
+        cls = request.cls
+        cls.tmpdir = str(tmp_path_factory.mktemp("shots"))
+
+        eset = build_grid()
+        eset.anchor()
+        # A scratch filestore, since a montage has to be saved for `Electrode`
+        # to find it and the real one is checked into the repo.
+        store = str(tmp_path_factory.mktemp("store"))
+        real = cortex.db.filestore
+        import shutil
+        shutil.copytree(os.path.join(real, SUBJECT), os.path.join(store, SUBJECT))
+        old = cortex.db.filestore
+        cortex.db.filestore = store
+        cortex.db.reload_subjects()
+        cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+
+        n = len(eset)
+        # Two frames that run the ramp in opposite directions, so a frame change
+        # has to alter what is on screen.
+        frames = np.vstack([np.linspace(0, 1, n), np.linspace(1, 0, n)])
+        view = cortex.Electrode(frames, SUBJECT, "native",
+                                cmap="viridis", vmin=0.0, vmax=1.0)
+        cls.n = n
+
+        with cortex.export.headless_viewer(view, viewer_params={}) as handle:
+            time.sleep(4)
+            cls.handle = handle
+            params = dict(default_view_params)
+            params.update(angle_view_params["left"])
+            params["surface.{subject}.unfold"] = 0.0
+            handle._set_view(**params)
+            time.sleep(2)
+            cls.baseline = cls._shot("frame0.png")
+            yield
+
+        cortex.db.filestore = old
+        cortex.db.reload_subjects()
+
+    def test_the_page_raises_no_errors(self):
+        errors = [e for e in type(self).handle._pw_thread.browser_errors
+                  if "[pageerror]" in e]
+        assert errors == [], "JS errors: %s" % errors
+
+    def test_the_markers_span_the_colormap(self):
+        """Rather than all sharing one flat colour, as P3a's did.
+
+        A ramp through viridis is purple at one end and yellow at the other, so
+        the drawn pixels have to vary in every channel. A single flat colour --
+        which is what a failure to bind the data looks like -- would give a
+        standard deviation near zero.
+        """
+        pixels = type(self).baseline
+        assert len(pixels) > 100, "no coloured markers were drawn"
+        assert pixels.std(0).min() > 15, (
+            "marker colours barely vary (%s); they are probably still flat"
+            % pixels.std(0)
+        )
+
+    def test_the_data_layer_is_not_drawn_on_the_cortex(self):
+        """Electrode data has no per-vertex array, so the cortex stays curvature.
+
+        `ElectrodeData.set` dispatches no attribute event, which leaves the
+        surface's data attributes at the empty arrays it was initialised with;
+        the shader reads `nanmask` as 0 there and discards the data layer. If
+        that ever stopped holding, the cortex would come back covered in
+        whatever the empty buffer decoded to, and these grey pixels would be
+        coloured.
+        """
+        from PIL import Image
+
+        img = np.asarray(
+            Image.open(os.path.join(type(self).tmpdir, "frame0.png")).convert("RGB"),
+            dtype=int,
+        )
+        sat = img.max(2) - img.min(2)
+        # The cortex is the large mid-grey region; markers are a few hundred px.
+        greyish = ((sat <= 40) & (img.mean(2) > 40) & (img.mean(2) < 220)).sum()
+        assert greyish > 20 * (sat > 40).sum(), "the cortex looks coloured, not grey"
+
+    def test_scrubbing_the_movie_recolours_the_markers(self):
+        cls = type(self)
+        cls.handle.setFrame(1)
+        time.sleep(1.5)
+        moved = cls._shot("frame1.png")
+        cls.handle.setFrame(0)
+        time.sleep(1.0)
+        assert not np.allclose(cls.baseline.mean(0), moved.mean(0), atol=6), (
+            "frame 1 looks identical to frame 0 (%s vs %s)"
+            % (cls.baseline.mean(0), moved.mean(0))
+        )
+
+    def test_the_vminvmax_sliders_recolour_the_markers(self):
+        """The property ELECTRODES_DESIGN.md's decision 3 is really about.
+
+        Clipping the range to its bottom fifth saturates almost every contact at
+        the top of the colormap, so the markers go overwhelmingly yellow -- a
+        change no amount of luck would produce from a static colour.
+        """
+        cls = type(self)
+        cls.handle.setVminmax(0.0, 0.2)
+        time.sleep(1.5)
+        try:
+            clipped = cls._shot("clipped.png")
+            assert not np.allclose(cls.baseline.mean(0), clipped.mean(0), atol=6)
+            red, green, blue = clipped.mean(0)
+            assert red > 150 and green > 150 and blue < 120, (
+                "clipping to the low end should drive viridis to yellow, got %s"
+                % clipped.mean(0)
+            )
+        finally:
+            cls.handle.setVminmax(0.0, 1.0)
+            time.sleep(1.0)
+
+
+# -- what the viewer is handed ---------------------------------------------
+
+
+def test_an_electrode_view_supplies_its_own_markers(tmp_path, monkeypatch):
+    """`cortex.webshow(elec)` needs no second `electrodes=` argument.
+
+    Requiring one would be a way to get the drawn markers and the drawn values
+    out of step with each other.
+    """
+    from cortex.webgl.view import _electrodes_from
+
+    store = str(tmp_path)
+    import shutil
+    shutil.copytree(os.path.join(cortex.db.filestore, SUBJECT),
+                    os.path.join(store, SUBJECT))
+    monkeypatch.setattr(cortex.db, "filestore", store)
+    cortex.db.reload_subjects()
+
+    eset = build_grid()
+    eset.anchor()
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    view = cortex.Electrode(np.arange(float(len(eset))), SUBJECT, "native")
+
+    assert list(_electrodes_from(view, None).names) == list(eset.names)
+    assert list(_electrodes_from(cortex.Dataset(x=view), None).names) == list(eset.names)
+    # ...and an explicit set still wins, which is how P3a drew a montage over
+    # somebody else's data.
+    other = eset.select(group_type="grid")[:4]
+    assert len(_electrodes_from(view, other)) == 4
+
+    # A dataset with no electrode views says nothing about electrodes.
+    assert _electrodes_from(cortex.Vertex.random(SUBJECT), None) is None
+
+
+def test_a_dataset_over_two_montages_refuses_to_guess(tmp_path, monkeypatch):
+    """One set of markers is drawn, so two montages have no single answer."""
+    from cortex.webgl.view import _electrodes_from
+
+    store = str(tmp_path)
+    import shutil
+    shutil.copytree(os.path.join(cortex.db.filestore, SUBJECT),
+                    os.path.join(store, SUBJECT))
+    monkeypatch.setattr(cortex.db, "filestore", store)
+    cortex.db.reload_subjects()
+
+    eset = build_grid()
+    eset.anchor()
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    cortex.db.save_montage(SUBJECT, eset, "research", overwrite=True)
+
+    values = np.arange(float(len(eset)))
+    both = cortex.Dataset(
+        a=cortex.Electrode(values, SUBJECT, "native"),
+        b=cortex.Electrode(values, SUBJECT, "research"),
+    )
+    with pytest.raises(ValueError, match="different montages"):
+        _electrodes_from(both, None)

@@ -114,6 +114,48 @@ def _electrode_viewopts(electrodes: Optional["ElectrodeSet"],
     return to_viewer_json(electrodes, ctm_index=index)
 
 
+def _electrodes_from(data: Any, electrodes: Optional["ElectrodeSet"]) -> Optional["ElectrodeSet"]:
+    """The electrode set a viewer should draw, given what it was handed.
+
+    An explicit ``electrodes=`` always wins -- it is how a set is drawn over
+    somebody else's data, which is what P3a shipped. Otherwise the dataset is
+    asked: if it holds :class:`cortex.Electrode` views, their montage is what the
+    markers should be, and requiring it to be passed a second time would be a
+    way to get the two out of step.
+
+    Only one set, because the markers are one `THREE.Group` per hemisphere and
+    every contact in it is placed against one subject's surfaces. Views over
+    different montages of the same template are still legal in one dataset --
+    they simply all draw at the first one's positions, which is right when they
+    are the same contacts and wrong when they are not, so the montages are
+    checked and the mismatch reported rather than drawn.
+    """
+    if electrodes is not None:
+        return electrodes
+
+    from ..dataset.views import ElectrodeView
+
+    # `normalize` leaves a lone view as itself and a mapping as a Dataset, so
+    # both shapes reach here.
+    candidates = (
+        list(data.views.values()) if hasattr(data, "views") else [data]
+    )
+    found = [v for v in candidates if isinstance(v, ElectrodeView)]
+    if not found:
+        return None
+
+    montages = {(v.montage, v.montage_subjects) for v in found}
+    if len(montages) > 1:
+        raise ValueError(
+            "this dataset holds electrode views over %d different montages (%s); "
+            "the viewer draws one set of markers, so pass the one to draw as "
+            "electrodes=, or show them in separate viewers"
+            % (len(montages), "; ".join(
+                "%s of %s" % (m, ", ".join(subs)) for m, subs in sorted(montages)))
+        )
+    return found[0].electrodes
+
+
 def make_static(
     outpath: str,
     data: Union[dataset.DatasetLike, dataset.Dataview],
@@ -241,7 +283,7 @@ def make_static(
     # the anonymisation below rewrites every value to a bundle-relative name and,
     # with `anonymize`, renames the keys too, so the CTM's vertex permutation
     # would be unreachable by the time the viewopts are assembled.
-    electrode_viewopts = _electrode_viewopts(electrodes, ctms)
+    electrode_viewopts = _electrode_viewopts(_electrodes_from(data, electrodes), ctms)
 
     db.auxfile = None
 
@@ -517,7 +559,7 @@ def show(
     my_viewopts: dict[str, Any] = dict(options.config.items('webgl_viewopts'))
     my_viewopts['overlays_visible'] = overlays_visible
     my_viewopts['labels_visible'] = labels_visible
-    my_viewopts['electrodes'] = _electrode_viewopts(electrodes, ctms)
+    my_viewopts['electrodes'] = _electrode_viewopts(_electrodes_from(data, electrodes), ctms)
     my_viewopts["brightness"] = (
         options.config.get("curvature", "brightness")
         if curvature_brightness is None
@@ -582,9 +624,22 @@ def show(
                     rangestr = self.request.headers['Range'].split('=')[1]
                     start, end = [ int(i) if len(i) > 0 else None for i in rangestr.split('-') ]
 
-                    clenheader = 'bytes %s-%s/%s' % (start, end or len(dataimg), len(dataimg) )
-                    self.set_header('Content-Range', clenheader)
-                    self.set_header('Content-Length', end-start+1)
+                    # Clamp to what there actually is. `NParray.fromURL` opens
+                    # every array with a fixed `bytes=0-1023` header read, and an
+                    # array shorter than that -- one value per contact, where a
+                    # per-vertex one has hundreds of thousands -- made this
+                    # promise 1024 bytes and then write 384, which Tornado
+                    # rejects as an HTTPOutputError and the browser reports as
+                    # ERR_CONTENT_LENGTH_MISMATCH. The offsets are inclusive, per
+                    # RFC 7233, which is also why the old header was one short.
+                    start = 0 if start is None else start
+                    last = len(dataimg) - 1
+                    end = last if end is None else min(end, last)
+
+                    self.set_header(
+                        'Content-Range', 'bytes %d-%d/%d' % (start, end, len(dataimg))
+                    )
+                    self.set_header('Content-Length', end - start + 1)
                     self.write(dataimg[start:end+1])
                 else:
                     self.write(dataimg)

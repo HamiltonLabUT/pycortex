@@ -551,6 +551,7 @@ var mriview = (function(module) {
             var cmapName = e.params.data.id;
             viewer.active.cmapName = cmapName;
             viewer.active.setColormap(cmapName);
+            viewer._refreshElectrodes();
             viewer.schedule();
             $('#colorlegend-colorbar').attr('src', colormaps[cmapName].image.currentSrc);
         });
@@ -1053,6 +1054,18 @@ var mriview = (function(module) {
         }
     };
 
+    // Push the active dataview's current colours onto any electrode markers.
+    // Called for every change that alters what a value should look like -- the
+    // colormap, the vmin/vmax sliders, the movie frame -- because those are the
+    // three things ELECTRODES_DESIGN.md asks the markers to track, and none of
+    // them goes through the surface shaders that carry them for vertex data.
+    module.Viewer.prototype._refreshElectrodes = function() {
+        for (var i = 0; i < this.surfs.length; i++) {
+            if (this.surfs[i].refreshElectrodes !== undefined)
+                this.surfs[i].refreshElectrodes();
+        }
+    };
+
     module.Viewer.prototype.setVminmax = function(vmin, vmax, dim) {
         if (dim === undefined)
             dim = 0;
@@ -1075,6 +1088,7 @@ var mriview = (function(module) {
         $(this.object).find(max).val(vmax);
 
         this.active.setVminmax(vmin, vmax, dim);
+        this._refreshElectrodes();
 
         this.schedule();
     };
@@ -1137,6 +1151,7 @@ var mriview = (function(module) {
         }
         this.frame = frame;
         this.active.setFrame(frame);
+        this._refreshElectrodes();
         if (this.movie) {
             this.movie.setFrame(frame);
         }
@@ -1356,6 +1371,7 @@ var mriview = (function(module) {
                     var name = $(this.object).find("#colormap .dd-selected-text").text();
                     if (this.active) {
                         this.active.setColormap(name);
+                        this._refreshElectrodes();
                         this.schedule();
                     }
                 }.bind(this)
