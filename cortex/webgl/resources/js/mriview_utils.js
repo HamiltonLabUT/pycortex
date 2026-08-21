@@ -204,6 +204,31 @@ var mriview = (function(module) {
         return {pos:pos, norm:norm, base:base};
     }
 
+    //Returns the world position of a barycentric point on a triangle, given the
+    //mix state. Electrodes are anchored to a triangle rather than to a vertex --
+    //contacts sit millimetres apart while vertices sit fractions of a millimetre
+    //apart, so snapping to the nearest vertex visibly distorts a grid's spacing.
+    //
+    //Implemented by blending three get_position calls rather than by
+    //reimplementing its arithmetic, so an electrode is displaced by exactly the
+    //same thickness, flat-offset and morph logic that moves the surface under it.
+    //The blend is not identical to evaluating that logic at the barycentric point
+    //-- it contains a normalize() and a sqrt() -- but the three corners of one
+    //triangle differ by a fraction of a millimetre in position, normal and
+    //thickness, so the difference is far below the size of a marker.
+    module.get_position_bary = function(posdata, surfmix, thickmix, verts, weights) {
+        var pos = new THREE.Vector3(0, 0, 0);
+        var norm = new THREE.Vector3(0, 0, 0);
+        for (var i = 0; i < 3; i++) {
+            if (!weights[i])
+                continue;
+            var vert = module.get_position(posdata, surfmix, thickmix, verts[i]);
+            pos.add(vert.pos.multiplyScalar(weights[i]));
+            norm.add(vert.norm.multiplyScalar(weights[i]));
+        }
+        return {pos:pos, norm:norm};
+    }
+
     module.computeNormal = function(vertices, index, offsets) {
         var i, il;
         var j, jl;

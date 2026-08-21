@@ -10,7 +10,7 @@ import shutil
 import sys
 import threading
 import time
-from typing import Sequence, TypeVar, TypedDict, Union, Any, Callable, Optional, ParamSpec, Literal, cast
+from typing import TYPE_CHECKING, Sequence, TypeVar, TypedDict, Union, Any, Callable, Optional, ParamSpec, Literal, cast
 import warnings
 import webbrowser
 from configparser import NoOptionError
@@ -23,6 +23,9 @@ import numpy.typing as npt
 from tornado import web
 
 from .. import dataset, options, utils, volume
+
+if TYPE_CHECKING:
+    from ..electrodes import ElectrodeSet
 from ..database import db
 from . import serve
 from ..dataset.views import _dumps
@@ -86,6 +89,31 @@ class AnimationDict(TypedDict):
 """
 
 
+
+def _electrode_viewopts(electrodes: Optional["ElectrodeSet"],
+                        ctms: Optional[dict]=None) -> Optional[dict]:
+    """The ``viewopts.electrodes`` blob, or None when there are no electrodes.
+
+    Anchors rather than positions: the browser re-derives a position for
+    whatever inflation and depth the sliders are at, which is the only way a
+    marker can stay on the cortex while the cortex moves. Anchoring here if the
+    caller has not already means a first call costs a nearest-face search over
+    the surfaces, so anchor once and reuse the set across viewers.
+    """
+    if electrodes is None:
+        return None
+    from ..electrodes import to_viewer_json
+    from ..electrodes._webgl import ctm_vertex_index
+
+    if electrodes.anchors is None:
+        electrodes.anchor()
+
+    index = None
+    if ctms is not None and electrodes.subject in ctms:
+        index = ctm_vertex_index(ctms[electrodes.subject])
+    return to_viewer_json(electrodes, ctm_index=index)
+
+
 def make_static(
     outpath: str,
     data: Union[dataset.DatasetLike, dataset.Dataview],
@@ -94,6 +122,7 @@ def make_static(
     anonymize: bool=False,
     overlays_available: Optional[tuple[str, ...]]=None,
     overlays_visible: tuple[str, ...]=("rois", "sulci"),
+    electrodes: Optional["ElectrodeSet"]=None,
     labels_visible: tuple[str, ...]=("rois",),
     types: tuple[str, ...]=("inflated",),
     html_embed: bool=True,
@@ -282,6 +311,7 @@ def make_static(
     my_viewopts: dict[str, Any] = dict(options.config.items("webgl_viewopts"))
     my_viewopts["overlays_visible"] = overlays_visible
     my_viewopts["labels_visible"] = labels_visible
+    my_viewopts["electrodes"] = _electrode_viewopts(electrodes, ctms)
     my_viewopts["brightness"] = (
         options.config.get("curvature", "brightness")
         if curvature_brightness is None
@@ -339,6 +369,7 @@ def show(
     template: str="mixer.html",
     overlays_available: Optional[Sequence[str]]=None,
     overlays_visible: Optional[Sequence[str]]=("rois", "sulci"),
+    electrodes: Optional["ElectrodeSet"]=None,
     labels_visible: Optional[Sequence[str]]=("rois",),
     types: Sequence[str]=("inflated",),
     overlay_file: Optional[str]=None,
@@ -480,6 +511,7 @@ def show(
     my_viewopts: dict[str, Any] = dict(options.config.items('webgl_viewopts'))
     my_viewopts['overlays_visible'] = overlays_visible
     my_viewopts['labels_visible'] = labels_visible
+    my_viewopts['electrodes'] = _electrode_viewopts(electrodes, ctms)
     my_viewopts["brightness"] = (
         options.config.get("curvature", "brightness")
         if curvature_brightness is None

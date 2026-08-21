@@ -322,8 +322,13 @@ Each phase is independently verifiable and independently useful.
   trust without consulting a legend. Marker *size* is constant in figure units
   and deliberately not scaled by areal distortion, per 2.2.
 - **P2** — `ElectrodeSpace` and the three views: colormapping, HDF, movies.
-- **P3** — webgl markers, `mix` tracking, shapes, sizes, filtering, hover and
-  click.
+- **P3a** — *done.* Markers in the viewer: one mesh per contact parented into
+  `pivots[hemi].back`, re-placed on every `mix` event via a barycentric sibling
+  of `get_position`, shape by group type, one flat colour, and a menu folder for
+  visibility, radius and stand-off. No shader changes, no new payload format —
+  the anchors ride inside `viewopts`.
+- **P3b** — colours from data, hover tooltip, click-through metadata panel,
+  filtering by group and anatomy.
 - **P4** — billboards for STRF and evoked data.
 
 ## 3. Decisions taken
@@ -382,7 +387,44 @@ and missed the eleven labelled as white matter or subcortical.
 Labels are stored verbatim. Normalising the vocabularies would discard the
 distinction that makes them useful.
 
-## 5. Still to settle
+## 5. Vertex order is shuffled twice, and both trips are mandatory
+
+The one thing in P3a that was not guessable, and the reason its test asserts a
+distance rather than inspecting a screenshot.
+
+A pycortex vertex index does not name the same vertex in the browser's buffers.
+Two separate permutations sit between them:
+
+1. **The CTM's spatial sort.** The viewer packs with OpenCTM's `mg2`, which
+   reorders vertices for compression. `brainctm` saves the permutation beside
+   the `.ctm` as an `.npz`, and per-vertex *data* is already permuted through it
+   in python by `Package.reorder` before being sent.
+2. **Three.js's chunk-local shuffle**, applied on load so each draw chunk fits
+   inside a 16-bit index. That one is `indexMap` / `reverseIndexMap`, and it is
+   local: on S1 it moves vertex 50000 to 51205, while the CTM sort moves it to
+   123806.
+
+So the full correspondence is `buffer[i] ↔ pycortex[index[reverseIndexMap[i]]]`.
+Electrodes make the first trip in python — `to_viewer_json` converts through the
+`.npz` — and the second in JavaScript, which is exactly what `svgoverlay` does,
+and why it needs only `map[idx]`: its `data-ptidx` values are *already* in CTM
+order.
+
+**Making only one of the two trips is not a visible failure.** The markers still
+land on the surface, still track inflation and flattening, still render without
+a single JavaScript error, and photograph like a finished feature. They are
+simply on the wrong vertices — scattered across the hemisphere instead of
+clustered. Three separate candidate mappings were tried against the screenshots
+before anyone measured anything, and all three looked equally plausible.
+
+What settled it was a number with an independently known answer: the contacts of
+an 8×8 grid at 8 mm pitch sit about 7 mm apart on cortex. Wrong indices gave
+51 mm. `test_electrodes_webgl.py` asserts that spacing against the value python
+computes for the same set, and separately asserts that the CTM permutation is
+not the identity — because if it ever became one, sending unconverted indices
+would start working by accident and the guard would rot.
+
+## 6. Still to settle
 
 - **quickflat's depth argument.** `make_figure` already takes `depth` for
   volumetric sampling. `add_electrodes` needs its own depth selection, and

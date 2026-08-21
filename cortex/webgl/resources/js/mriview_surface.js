@@ -305,7 +305,30 @@ var mriview = (function(module) {
                 this.svg.loaded.done(function() { 
                     this.ui.addFolder("overlays", true, this.svg.ui);
                 }.bind(this));
-            } else if (json.extratex !== undefined) { //extratex
+            }
+
+            //electrodes, if the page was given any. Parented into the same pivots
+            //as the picker markers and the ROI labels, which is what earns them
+            //the hemisphere separation, the pivot rotation and the flatten flip
+            //for free; positioned in world space they would have to reimplement
+            //all three and would drift out of step with the surface.
+            if (typeof viewopts !== "undefined" && viewopts.electrodes) {
+                this.electrodes = new electrodes.Electrodes(viewopts.electrodes, posdata, this);
+                this.electrodes.markers.left.position.y = -this.flatoff[1];
+                this.electrodes.markers.right.position.y = -this.flatoff[1];
+                this.pivots.left.back.add(this.electrodes.markers.left);
+                this.pivots.right.back.add(this.electrodes.markers.right);
+                this.addEventListener("mix", this.electrodes.setMix.bind(this.electrodes));
+                //Place them once now: "mix" only fires on a change, and until one
+                //happens every marker would sit at the origin.
+                this.electrodes.setMix({
+                    mix: this.uniforms.surfmix.value,
+                    thickmix: this.uniforms.thickmix.value,
+                });
+                this.ui.addFolder("electrodes", true, this.electrodes.ui);
+            }
+
+            if (json.extratex !== undefined) { //extratex
                 this.uniforms.extratex.value = THREE.ImageUtils.loadTexture(json.extratex);
             } else {
                 this.loaded.resolve();

@@ -59,6 +59,7 @@ from ._io import (
     to_dict,
     write_electrodes_tsv,
 )
+from ._webgl import to_viewer_json
 from ._set import (
     GROUP_TYPES,
     STATUSES,
@@ -97,6 +98,7 @@ __all__ = [
     "check_alignment",
     "check_hemispheres",
     # io
+    "to_viewer_json",
     "load_electrodes",
     "read_electrodes_tsv",
     "read_elecs_mat",
