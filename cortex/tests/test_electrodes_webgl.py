@@ -177,28 +177,15 @@ class TestMarkersInTheViewer:
         # A 64-contact grid at 8 mm pitch spans well under half a hemisphere.
         assert extent.max() < 90.0
 
-    def test_at_unfold_zero_and_no_lift_markers_sit_at_their_true_coordinates(self):
+    def test_at_unfold_zero_markers_sit_at_their_true_coordinates(self):
         """On the anatomical surface the measured coordinate is the truth.
 
-        A depth contact belongs inside the brain; snapping it to the nearest
-        gyrus would draw a position it does not have. The anchor only takes
-        over once the surface deforms and the coordinate stops meaning
-        anything.
-
-        Stated at lift 0, because lift deliberately trades that exactness for
-        visibility: a subdural contact recorded at the pial surface is
-        swallowed by an opaque cortex, so the default stands markers off along
-        the local normal. Zero lift gets the measured position back exactly.
+        Markers are drawn exactly there and never stood off, so a depth
+        contact is inside the brain because that is where it is. Turn
+        `surface_opacity` down to see those; do not move the marker.
         """
-        e = type(self).handle.surfs[0].surf.electrodes
-        e.setLift(0.0)
-        time.sleep(1)
-        try:
-            drawn = np.array([c["position"] for c in self._describe()])
-            assert np.allclose(drawn, type(self).eset.coords, atol=1e-3)
-        finally:
-            e.setLift(1.0)
-            time.sleep(0.5)
+        drawn = np.array([c["position"] for c in self._describe()])
+        assert np.allclose(drawn, type(self).eset.coords, atol=1e-3)
 
     def _describe(self):
         reported = type(self).handle.surfs[0].surf.electrodes.describe()
@@ -299,7 +286,7 @@ class TestMarkersInTheViewer:
         time.sleep(0.5)
         assert U(e.countVisible()) == everything
 
-    def test_shape_and_size_controls(self):
+    def test_shape_control(self):
         e = type(self).handle.surfs[0].surf.electrodes
 
         def U(v):
@@ -311,11 +298,24 @@ class TestMarkersInTheViewer:
         time.sleep(0.5)
         assert U(e.setShape()) == "cube"
         e.setShape("sphere")
-
-        e.setSizeByDiameter(True)
         time.sleep(0.5)
-        assert U(e.setSizeByDiameter()) is True
-        e.setSizeByDiameter(False)
+
+    def test_marker_radius_comes_from_the_recorded_diameter(self):
+        """Half the contact's own diameter, or the fallback where the montage
+        records none. No global radius control: the montage already knows how
+        big its electrodes are."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        eset = type(self).eset
+        for i in range(min(4, len(eset))):
+            expected = (eset.size[i] / 2 if np.isfinite(eset.size[i])
+                        else U(e.radius))
+            assert U(e.contacts[i].radius) == pytest.approx(expected)
 
     def test_clicking_a_contact_opens_the_metadata_panel(self):
         """Driven through the real hit test, by projecting a contact to screen

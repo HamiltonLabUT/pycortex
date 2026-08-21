@@ -22,19 +22,30 @@ var electrodes = (function(module) {
 
     module.DEFAULT_SHAPE = "sphere";
 
-    module.makeGeometries = function(radius) {
-        return {
-            sphere:  new THREE.SphereGeometry(radius, 12, 8),
-            cube:    new THREE.BoxGeometry(radius * 1.7, radius * 1.7, radius * 1.7),
-            diamond: new THREE.OctahedronGeometry(radius * 1.35),
-        };
-    }
+    // One geometry per shape and radius, shared between every contact that wants
+    // it. A montage records a handful of distinct diameters at most, so this
+    // stays a handful of geometries however many contacts there are.
+    module.makeGeometry = function(cache, shape, radius) {
+        var key = shape + ":" + radius.toFixed(3);
+        if (cache[key] === undefined) {
+            if (shape === "cube")
+                cache[key] = new THREE.BoxGeometry(radius * 1.7, radius * 1.7, radius * 1.7);
+            else if (shape === "diamond")
+                cache[key] = new THREE.OctahedronGeometry(radius * 1.35);
+            else
+                cache[key] = new THREE.SphereGeometry(radius, 12, 8);
+        }
+        return cache[key];
+    };
 
     module.Electrodes = function(json, posdata, surf) {
         this.surf = surf;
         this.posdata = posdata;
+        // Fallback radius, in millimetres. Each contact overrides it with half
+        // its own recorded diameter where the montage has one, so markers are
+        // drawn at the size the electrodes actually are.
         this.radius = json.radius === undefined ? 1.5 : json.radius;
-        this.lift = json.lift === undefined ? 1.0 : json.lift;
+        this.geometries = {};
         this._raw = new THREE.Vector3();   // scratch, reused every frame
         // How far, in millimetres, a contact may sit from the depth currently
         // being sampled and still be drawn on a deformed surface. Null shows
@@ -47,7 +58,6 @@ var electrodes = (function(module) {
         this.markers.right.name = "electrodes_right";
         this.contacts = [];
 
-        this.geometries = module.makeGeometries(this.radius);
         // Unlit: the scene carries no lights, so a Lambert or Phong material
         // would render black. Flat colour is also all this phase claims to do --
         // colouring by data is a later step and brings its own shader.
@@ -81,7 +91,13 @@ var electrodes = (function(module) {
             // the flat colour, so a page with no electrode data looks exactly as
             // it did before -- at the cost of one small material each, which for
             // a few hundred contacts is nothing.
-            var mesh = new THREE.Mesh(this.geometries[shape], this.material.clone());
+            // Half the recorded contact diameter, or the fallback. `size` is a
+            // diameter in millimetres; the geometries take a radius.
+            var radius = contact.size ? contact.size / 2 : this.radius;
+            var mesh = new THREE.Mesh(
+                module.makeGeometry(this.geometries, shape, radius),
+                this.material.clone()
+            );
             mesh.name = contact.name;
             this.markers[contact.hemi].add(mesh);
 
@@ -92,6 +108,7 @@ var electrodes = (function(module) {
                 rawVerts:   [contact.verts[0], contact.verts[1], contact.verts[2]],
                 weights:    contact.weights,
                 shape:      shape,
+                radius:     radius,
                 mesh:       mesh,
                 name:       contact.name,
                 group:      contact.group,
@@ -114,12 +131,9 @@ var electrodes = (function(module) {
 
         this.ui = (new jsplot.Menu()).add({
             visible: {action:[this, "setVisible"]},
-            radius:  {action:[this, "setRadius", 0.5, 6.0]},
-            lift:    {action:[this, "setLift", 0.0, 4.0]},
             labels:  {action:[this, "setLabels"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
             shape: {action:[this, "setShape", ["sphere", "cube", "diamond"]]},
-            size_by_diameter: {action:[this, "setSizeByDiameter"]},
         });
         if (this._filterFields.length)
             this.ui.addFolder("filter", true, this.filterUI);
@@ -154,24 +168,6 @@ var electrodes = (function(module) {
                 // so there is no "sampled depth" to be near or far from.
                 contact.mesh.visible = this._visible && this._passesFilters(contact);
 
-                // ...but still stand it off along the local normal. A measured
-                // coordinate is the truth and `lift` at 0 draws exactly that,
-                // which is what a depth electrode needs. It is the wrong default
-                // for a subdural contact: those are recorded at or just inside
-                // the pial surface, an opaque cortex swallows them whole, and
-                // the result is markers that are present, hoverable and
-                // labelled while being completely invisible. Lift applied only
-                // in the morphed branch made this control silently do nothing
-                // in the view it is needed in most.
-                if (this.lift !== 0) {
-                    var at0 = mriview.get_position_bary(
-                        this.posdata[contact.hemi], 0, evt.thickmix,
-                        contact.verts, contact.weights
-                    );
-                    this._raw.add(
-                        at0.norm.normalize().multiplyScalar(this.radius * this.lift)
-                    );
-                }
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
@@ -189,11 +185,6 @@ var electrodes = (function(module) {
             var vert = mriview.get_position_bary(
                 this.posdata[contact.hemi], evt.mix, evt.thickmix,
                 contact.verts, contact.weights
-            );
-            // Stand the marker off along the local normal, so it reads as sitting
-            // on the cortex rather than half sunk into it.
-            vert.pos.add(
-                vert.norm.normalize().multiplyScalar(this.radius * this.lift)
             );
             contact.mesh.position.copy(
                 t >= 1 ? vert.pos : this._raw.lerp(vert.pos, t)
@@ -381,7 +372,7 @@ var electrodes = (function(module) {
             // Scaled off the marker radius so labels stay legible whatever the
             // brain is measured in -- pycortex surfaces are millimetres, the
             // viewer this came from used metres.
-            var label = module.makeLabelSprite(contact.name, this.radius * 4);
+            var label = module.makeLabelSprite(contact.name, contact.radius * 4);
             label.visible = false;
             contact.label = label;
             this.labels.push(label);
@@ -622,43 +613,14 @@ var electrodes = (function(module) {
             return this._shape || module.DEFAULT_SHAPE;
         this._shape = val;
         for (var i = 0; i < this.contacts.length; i++) {
-            this.contacts[i].shape = val;
-            this.contacts[i].mesh.geometry = this.geometries[val];
+            var c = this.contacts[i];
+            c.shape = val;
+            c.mesh.geometry = module.makeGeometry(this.geometries, val, c.radius);
         }
         // Swapping the geometry changes nothing on screen by itself: the viewer
         // only paints when something asks it to, and a menu action is not a
         // "mix" event. Without this the dropdown appears dead -- the meshes are
         // cubes, the picture is still spheres.
-        this._refresh();
-    };
-
-    // Scale each marker by its own contact diameter. Off by default: a size
-    // that encodes something is only worth having when the reader knows it does.
-    // Scale each marker by its own contact diameter. Off by default: a size
-    // that encodes something is only worth having when the reader knows it does.
-    //
-    // Scaled against the largest diameter, into [0.5, 1], rather than as a ratio
-    // to the median. A ratio is unbounded on both sides -- a montage whose
-    // median diameter is small turns the big contacts into boulders that swamp
-    // the brain, which is what the first version did -- and it also has no floor,
-    // so the small ones shrink to nothing. Bounding it keeps every contact
-    // visible and still ranks them by size, which is all the encoding claims.
-    module.Electrodes.prototype.setSizeByDiameter = function(val) {
-        if (val === undefined)
-            return !!this._sizeByDiameter;
-        this._sizeByDiameter = val;
-
-        var largest = 0;
-        for (var i = 0; i < this.contacts.length; i++)
-            if (this.contacts[i].size > largest) largest = this.contacts[i].size;
-
-        for (var i = 0; i < this.contacts.length; i++) {
-            var c = this.contacts[i];
-            var scale = (val && c.size && largest > 0)
-                ? 0.5 + 0.5 * (c.size / largest)
-                : 1.0;
-            c.mesh.scale.set(scale, scale, scale);
-        }
         this._refresh();
     };
 
@@ -678,7 +640,7 @@ var electrodes = (function(module) {
         for (var i = 0; i < this.contacts.length; i++) {
             var contact = this.contacts[i];
             contact.label.position.copy(contact.mesh.position);
-            contact.label.position.z += this.radius * 2.5;
+            contact.label.position.z += contact.radius * 2.5;
             contact.label.visible = contact.mesh.visible
                 && (!!this._labelsOn || contact === this._hovered);
         }
@@ -691,26 +653,6 @@ var electrodes = (function(module) {
         this.markers.left.visible = val;
         this.markers.right.visible = val;
         this.surf.dispatchEvent({type:"update"});
-    }
-
-    module.Electrodes.prototype.setRadius = function(val) {
-        if (val === undefined)
-            return this.radius;
-        this.radius = val;
-        var geometries = module.makeGeometries(val);
-        for (var i = 0; i < this.contacts.length; i++)
-            this.contacts[i].mesh.geometry = geometries[this.contacts[i].shape];
-        for (var shape in this.geometries)
-            this.geometries[shape].dispose();
-        this.geometries = geometries;
-        this._refresh();
-    }
-
-    module.Electrodes.prototype.setLift = function(val) {
-        if (val === undefined)
-            return this.lift;
-        this.lift = val;
-        this._refresh();
     }
 
     // Re-place the markers at the surface's current state, for a change that did

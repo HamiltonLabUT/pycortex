@@ -64,7 +64,6 @@ def to_viewer_json(
     placeable_only: bool = True,
     radius: float = 1.5,
     color: str = "#ffcc33",
-    lift: float = 1.0,
 ) -> dict[str, Any]:
     """Serialise an electrode set for the browser.
 
@@ -86,13 +85,12 @@ def to_viewer_json(
         draw: an unplaced one would sit whereever its meaningless anchor pointed
         and look exactly like a real one.
     radius : float
-        Marker radius in millimetres, the same units as the surface.
+        Fallback marker radius in millimetres, the same units as the surface.
+        Each contact overrides it with half its own recorded diameter where the
+        montage has one, so markers are drawn at the size the electrodes are.
     color : str
         A CSS colour for every marker. One colour is all this carries -- colour
         by data value belongs with the ``Electrode`` views and their colormap.
-    lift : float
-        How far to stand a marker off the surface, in multiples of ``radius``,
-        so it reads as sitting on the cortex rather than sunk into it.
 
     Returns
     -------
@@ -149,7 +147,6 @@ def to_viewer_json(
         "electrodes": contacts,
         "radius": float(radius),
         "color": color,
-        "lift": float(lift),
         "subject": eset.subject,
     }
 
