@@ -97,10 +97,13 @@ var electrodes = (function(module) {
             });
         }
 
+        this._buildLabels();
+
         this.ui = (new jsplot.Menu()).add({
             visible: {action:[this, "setVisible"]},
             radius:  {action:[this, "setRadius", 0.5, 6.0]},
             lift:    {action:[this, "setLift", 0.0, 4.0]},
+            labels:  {action:[this, "setLabels"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
         });
     }
@@ -160,6 +163,7 @@ var electrodes = (function(module) {
                 t >= 1 ? vert.pos : this._raw.lerp(vert.pos, t)
             );
         }
+        this._placeLabels();
     }
 
     // Draw markers whatever is in front of them. Needed the moment the surface
@@ -194,6 +198,78 @@ var electrodes = (function(module) {
         this.material.needsUpdate = true;
         for (var i = 0; i < this.contacts.length; i++)
             this.contacts[i].mesh.renderOrder = val ? 999 : 0;
+    };
+
+    // -- channel-name labels ------------------------------------------------
+    //
+    // A camera-facing sprite per contact, carrying its channel name. Ported from
+    // makeLabelSprite in a hand-written three.js viewer of Liberty's, with two
+    // substitutions this three.js (r69) forces: THREE.CanvasTexture does not
+    // exist yet, so the canvas goes through a plain THREE.Texture with
+    // needsUpdate set, and renderOrder does not exist either -- but r69 draws
+    // sprites in their own pass after the opaque geometry, so depthTest:false
+    // alone already puts labels on top.
+    module.makeLabelSprite = function(text, height) {
+        var canvas = document.createElement("canvas");
+        var ctx = canvas.getContext("2d");
+        var fontSize = 48;
+        ctx.font = fontSize + "px sans-serif";
+        canvas.width = Math.ceil(ctx.measureText(text).width) + 20;
+        canvas.height = fontSize + 20;
+
+        // Resizing the canvas resets the context, so the font is set twice.
+        ctx.font = fontSize + "px sans-serif";
+        ctx.fillStyle = "rgba(20, 20, 20, 0.72)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#ffffff";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, 10, canvas.height / 2);
+
+        var texture = new THREE.Texture(canvas);
+        texture.minFilter = THREE.LinearFilter;
+        texture.needsUpdate = true;
+
+        var sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+            map: texture, transparent: true, depthTest: false,
+        }));
+        sprite.scale.set(height * canvas.width / canvas.height, height, 1);
+        return sprite;
+    };
+
+    module.Electrodes.prototype._buildLabels = function() {
+        this.labels = [];
+        for (var i = 0; i < this.contacts.length; i++) {
+            var contact = this.contacts[i];
+            // Scaled off the marker radius so labels stay legible whatever the
+            // brain is measured in -- pycortex surfaces are millimetres, the
+            // viewer this came from used metres.
+            var label = module.makeLabelSprite(contact.name, this.radius * 4);
+            label.visible = false;
+            contact.label = label;
+            this.labels.push(label);
+            this.markers[contact.hemi].add(label);
+        }
+    };
+
+    module.Electrodes.prototype.setLabels = function(val) {
+        if (val === undefined)
+            return !!this._labelsOn;
+        this._labelsOn = val;
+        this._placeLabels();
+    };
+
+    // Labels sit just above their marker, and are only shown for markers that
+    // are themselves visible -- otherwise a depth-filtered contact would leave
+    // its name floating over nothing.
+    module.Electrodes.prototype._placeLabels = function() {
+        if (this.labels === undefined)
+            return;
+        for (var i = 0; i < this.contacts.length; i++) {
+            var contact = this.contacts[i];
+            contact.label.position.copy(contact.mesh.position);
+            contact.label.position.z += this.radius * 2.5;
+            contact.label.visible = !!this._labelsOn && contact.mesh.visible;
+        }
     };
 
     module.Electrodes.prototype.setVisible = function(val) {

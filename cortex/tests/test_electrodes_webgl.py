@@ -221,6 +221,18 @@ class TestMarkersInTheViewer:
         assert at_pia != at_wm, "the depth slider did not change what is drawn"
         assert len(at_wm) < len(at_pia)
 
+    def test_channel_name_labels_toggle(self):
+        """Off by default, and only shown for markers that are themselves
+        visible -- otherwise a filtered-out contact leaves its name floating
+        over nothing."""
+        e = type(self).handle.surfs[0].surf.electrodes
+        assert e.setLabels() in (False, [False])
+        e.setLabels(True)
+        time.sleep(1)
+        assert e.setLabels() in (True, [True])
+        e.setLabels(False)
+        time.sleep(0.5)
+
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
                   if "[pageerror]" in e]
