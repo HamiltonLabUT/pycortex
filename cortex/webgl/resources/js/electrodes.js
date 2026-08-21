@@ -606,26 +606,41 @@ var electrodes = (function(module) {
             this.contacts[i].shape = val;
             this.contacts[i].mesh.geometry = this.geometries[val];
         }
+        // Swapping the geometry changes nothing on screen by itself: the viewer
+        // only paints when something asks it to, and a menu action is not a
+        // "mix" event. Without this the dropdown appears dead -- the meshes are
+        // cubes, the picture is still spheres.
+        this._refresh();
     };
 
     // Scale each marker by its own contact diameter. Off by default: a size
     // that encodes something is only worth having when the reader knows it does.
+    // Scale each marker by its own contact diameter. Off by default: a size
+    // that encodes something is only worth having when the reader knows it does.
+    //
+    // Scaled against the largest diameter, into [0.5, 1], rather than as a ratio
+    // to the median. A ratio is unbounded on both sides -- a montage whose
+    // median diameter is small turns the big contacts into boulders that swamp
+    // the brain, which is what the first version did -- and it also has no floor,
+    // so the small ones shrink to nothing. Bounding it keeps every contact
+    // visible and still ranks them by size, which is all the encoding claims.
     module.Electrodes.prototype.setSizeByDiameter = function(val) {
         if (val === undefined)
             return !!this._sizeByDiameter;
         this._sizeByDiameter = val;
-        var sizes = [];
+
+        var largest = 0;
         for (var i = 0; i < this.contacts.length; i++)
-            if (this.contacts[i].size) sizes.push(this.contacts[i].size);
-        sizes.sort(function(a, b) { return a - b; });
-        // Scale around the median, so markers stay the size the radius slider
-        // says whatever millimetre values this lab records.
-        var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 1.0;
+            if (this.contacts[i].size > largest) largest = this.contacts[i].size;
+
         for (var i = 0; i < this.contacts.length; i++) {
             var c = this.contacts[i];
-            var scale = (val && c.size) ? (c.size / median) : 1.0;
+            var scale = (val && c.size && largest > 0)
+                ? 0.5 + 0.5 * (c.size / largest)
+                : 1.0;
             c.mesh.scale.set(scale, scale, scale);
         }
+        this._refresh();
     };
 
     module.Electrodes.prototype.setLabels = function(val) {
