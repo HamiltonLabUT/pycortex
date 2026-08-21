@@ -36,6 +36,10 @@ var electrodes = (function(module) {
         this.radius = json.radius === undefined ? 1.5 : json.radius;
         this.lift = json.lift === undefined ? 1.0 : json.lift;
         this._raw = new THREE.Vector3();   // scratch, reused every frame
+        // How far, in millimetres, a contact may sit from the depth currently
+        // being sampled and still be drawn on a deformed surface. Null shows
+        // everything.
+        this.depthWindow = json.depth_window === undefined ? 2.0 : json.depth_window;
         this._visible = true;
 
         this.markers = {left:new THREE.Group(), right:new THREE.Group()};
@@ -88,6 +92,8 @@ var electrodes = (function(module) {
                 group:      contact.group,
                 group_type: contact.group_type,
                 depth:      contact.depth,
+                depth_mm:   contact.depth_mm,
+                thickness:  contact.thickness_mm,
             });
         }
 
@@ -95,6 +101,7 @@ var electrodes = (function(module) {
             visible: {action:[this, "setVisible"]},
             radius:  {action:[this, "setRadius", 0.5, 6.0]},
             lift:    {action:[this, "setLift", 0.0, 4.0]},
+            depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
         });
     }
 
@@ -123,9 +130,22 @@ var electrodes = (function(module) {
                 this._raw.fromArray(contact.coords);
             }
             if (t <= 0) {
+                // Anatomical surface: every contact is at its measured position,
+                // so there is no "sampled depth" to be near or far from.
+                contact.mesh.visible = this._visible;
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
+
+            // Once the surface deforms it is showing one depth through the
+            // ribbon -- thickmix 0 is the pia, 1 the white matter -- and a
+            // contact that is not at that depth is not on the sheet being
+            // drawn. Hide it rather than project it onto a surface it is not
+            // near, which is the same reasoning as the placement policy: draw
+            // what is there, not what would look tidy.
+            contact.mesh.visible = this._visible && this._nearSampledDepth(contact, evt.thickmix);
+            if (!contact.mesh.visible)
+                continue;
 
             var vert = mriview.get_position_bary(
                 this.posdata[contact.hemi], evt.mix, evt.thickmix,
@@ -141,6 +161,40 @@ var electrodes = (function(module) {
             );
         }
     }
+
+    // Draw markers whatever is in front of them. Needed the moment the surface
+    // goes translucent: blending does not remove it from the depth buffer, so a
+    // contact inside the brain stays culled however see-through the cortex
+    // looks. renderOrder puts them after the hull so they are not blended over.
+    // Is this contact within the depth window of the surface being sampled?
+    // A contact with no known depth -- a subject with no white-matter surface --
+    // cannot fail the test, so it is always shown.
+    module.Electrodes.prototype._nearSampledDepth = function(contact, thickmix) {
+        if (this.depthWindow === null || this.depthWindow === undefined)
+            return true;
+        if (contact.depth_mm === null || contact.thickness === null)
+            return true;
+        var sampled = thickmix * contact.thickness;     // mm from the pia
+        return Math.abs(contact.depth_mm - sampled) <= this.depthWindow;
+    };
+
+    module.Electrodes.prototype.setDepthWindow = function(val) {
+        if (val === undefined)
+            return this.depthWindow;
+        // The top of the slider means "no filtering" rather than a 20 mm window,
+        // which would be an arbitrary number pretending to be a limit.
+        this.depthWindow = val >= 20 ? null : val;
+        this._refresh();
+    };
+
+    module.Electrodes.prototype.setXray = function(val) {
+        if (val === undefined)
+            return !this.material.depthTest;
+        this.material.depthTest = !val;
+        this.material.needsUpdate = true;
+        for (var i = 0; i < this.contacts.length; i++)
+            this.contacts[i].mesh.renderOrder = val ? 999 : 0;
+    };
 
     module.Electrodes.prototype.setVisible = function(val) {
         if (val === undefined)
@@ -188,6 +242,7 @@ var electrodes = (function(module) {
                 name: contact.name, group: contact.group,
                 group_type: contact.group_type, hemi: contact.hemi,
                 depth: contact.depth, shape: contact.shape,
+                visible: contact.mesh.visible,
                 verts: contact.verts, weights: contact.weights,
                 position: contact.mesh.position.toArray(),
             };

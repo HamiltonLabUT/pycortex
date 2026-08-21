@@ -188,6 +188,39 @@ class TestMarkersInTheViewer:
         drawn = np.array([c["position"] for c in type(self).reported])
         assert np.allclose(drawn, type(self).eset.coords, atol=1e-3)
 
+    def test_the_depth_window_follows_the_sampled_surface(self):
+        """A deformed surface shows one depth through the ribbon at a time.
+
+        A contact that is not at that depth is not on the sheet being drawn, so
+        it is hidden rather than projected onto a surface it is nowhere near --
+        the same reasoning as the placement policy. Which contacts survive has
+        to change when the depth slider moves from pia to white matter; if it
+        does not, the slider is writing the uniform without telling anything
+        that positions itself on the CPU, which is exactly the bug this pins.
+        """
+        handle = type(self).handle
+        handle.ui.set("surface.S1.unfold", 0.5)
+        time.sleep(1.5)
+
+        def visible_at(thickmix):
+            handle.ui.set("surface.S1.depth", thickmix)
+            time.sleep(1.5)
+            reported = handle.surfs[0].surf.electrodes.describe()
+            while (isinstance(reported, list) and len(reported) == 1
+                   and isinstance(reported[0], list)):
+                reported = reported[0]
+            return {c["name"] for c in reported if c["visible"]}
+
+        at_pia, at_wm = visible_at(0.0), visible_at(1.0)
+        handle.ui.set("surface.S1.unfold", 0.0)
+        time.sleep(1.5)
+
+        # A grid sits at the pia, so sampling there shows it and sampling the
+        # white matter does not.
+        assert at_pia, "nothing visible when sampling the pial surface"
+        assert at_pia != at_wm, "the depth slider did not change what is drawn"
+        assert len(at_wm) < len(at_pia)
+
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
                   if "[pageerror]" in e]

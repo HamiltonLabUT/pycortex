@@ -55,6 +55,8 @@ var mriview = (function(module) {
 
                 thickmix:   { type:'f',  value:0.5},
                 surfmix:    { type:'f',  value:0},
+                surfaceAlpha:{ type:'f', value:1.0},
+                fresnelPower:{ type:'f', value:2.5},
                 bumpyflat:  { type:'i',  value:viewopts.bumpy_flatmap == 'true'},
                 allowtilt:  { type:'i',  value:viewopts.allow_tilt == 'true'},
                 // equivolume:  { type:'i',  value:viewopts.equivolume == 'true'},
@@ -87,7 +89,11 @@ var mriview = (function(module) {
             unfold: {action:[this, "setMix", 0., 1.]},
             pivot: {action:[this, "setPivot", -180, 180]},
             shift: {action:[this, "setShift", 0, 200]},
-            depth: {action:[this.uniforms.thickmix, "value", 0, 1]},
+            // Writes the uniform, as before -- the surface shader reads it every
+            // frame -- and additionally nudges anything positioned on the CPU
+            // against that depth. Deliberately not bound to setThickMix, whose
+            // full "mix" dispatch deadlocks the viewer from here.
+            depth: {action:[this, "setSampleDepth", 0, 1]},
             "pial surface": {action: this.to_pial_surface.bind(this), key: 'p', help: "Pial surface"},
             "fiducial surface": {action: this.to_fiducial_surface.bind(this), key: 'u', help: "Fiducial surface"},
             "WM surface": {action: this.to_white_matter_surface.bind(this), key: 'y', help: "White matter surface"},
@@ -98,6 +104,8 @@ var mriview = (function(module) {
             changeInflation: {action: this.changeInflation.bind(this), wheel: true, modKeys: ['shiftKey'], hidden: true, help:'Change inflation'},
             colorbar: {action:[this, "toggleColorbar"]},
             opacity: {action:[this.uniforms.dataAlpha, "value", 0, 1]},
+            transparency: {action:[this, "setSurfaceAlpha", 1, 0]},
+            ghostiness: {action:[this, "setFresnelPower", 0.5, 6]},
             toggleOpacity: {action: this.toggleOpacity.bind(this), key: 'o', hidden: true, help:'Toggle data opacity'},
             left: {action:[this, "setLeftVis"]},
             leftToggle: {action: this.toggleLeftVis.bind(this), key: 'L', modKeys: ['shiftKey'], hidden: true, help:'Toggle left hemisphere'},
@@ -407,7 +415,42 @@ var mriview = (function(module) {
                 sampler: this._sampler,
             });
             this.shaders[dataview.uuid] = shaders[0];
+            this._applySurfaceAlpha(shaders[0]);
         }.bind(this));
+    };
+
+    // Depth-writing goes off with translucency, because alpha blending does not
+    // take the surface out of the depth buffer and anything inside the brain
+    // stays culled otherwise. On its own that shreds a folded surface -- the far
+    // bank draws over the near one in arbitrary order -- which is what the
+    // Fresnel term in the fragment shader is for: the far bank ends up faint
+    // enough that the disorder reads as depth rather than as noise.
+    module.Surface.prototype._applySurfaceAlpha = function(shader) {
+        var alpha = this.uniforms.surfaceAlpha.value;
+        shader.transparent = alpha < 1;
+        shader.depthWrite = alpha >= 1;
+        shader.needsUpdate = true;
+    };
+
+    module.Surface.prototype.setSurfaceAlpha = function(val) {
+        if (val === undefined)
+            return this.uniforms.surfaceAlpha.value;
+        this.uniforms.surfaceAlpha.value = val;
+        for (var name in this.shaders)
+            this._applySurfaceAlpha(this.shaders[name]);
+        // Markers stop depth-testing once the hull is see-through, so a contact
+        // behind cortex is drawn rather than culled. Near and far contacts then
+        // look alike, which is the trade an x-ray view is asking for.
+        if (this.electrodes !== undefined)
+            this.electrodes.setXray(val < 1);
+        this.dispatchEvent({type:"update"});
+    };
+
+    module.Surface.prototype.setFresnelPower = function(val) {
+        if (val === undefined)
+            return this.uniforms.fresnelPower.value;
+        this.uniforms.fresnelPower.value = val;
+        this.dispatchEvent({type:"update"});
     };
     module.Surface.prototype.pick = function(renderer, camera, x, y) {
         // console.log(intersects[0].object.geometry.name);
@@ -530,6 +573,15 @@ var mriview = (function(module) {
         
         this.dispatchEvent({type:'mix', flat:clipped, mix:mix, thickmix:this.uniforms.thickmix.value});
     };
+    module.Surface.prototype.setSampleDepth = function(val) {
+        if (val === undefined)
+            return this.uniforms.thickmix.value;
+        this.uniforms.thickmix.value = val;
+        if (this.electrodes !== undefined)
+            this.electrodes.setMix({mix: this.uniforms.surfmix.value, thickmix: val});
+        this.dispatchEvent({type:"update"});
+    };
+
     module.Surface.prototype.setThickMix = function(val) {
         this.uniforms.thickmix.value = val;
 

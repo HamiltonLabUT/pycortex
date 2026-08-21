@@ -133,6 +133,12 @@ def to_viewer_json(
             "verts": _ctm_verts(anchors.verts[i], hemi, ctm_index, left_nverts),
             "weights": [float(w) for w in anchors.weights[i]],
             "depth": _finite(anchors.depth[i]),
+            # Millimetres as well as the normalised depth, because the viewer's
+            # depth window is specified in millimetres and cortical thickness
+            # varies from about 1 to 4.5 mm across the surface -- a window in
+            # normalised units would mean something different in every gyrus.
+            "depth_mm": _finite(anchors.depth_mm[i]),
+            "thickness_mm": _finite(anchors.thickness_mm[i]),
             "anatomy": str(eset.anatomy[i]),
             "placement": str(anchors.placement[i]),
         })

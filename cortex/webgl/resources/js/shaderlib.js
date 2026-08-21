@@ -136,6 +136,8 @@ var Shaderlib = (function() {
             "uniform float specularStrength;",
 
             "uniform float dataAlpha;",
+            "uniform float surfaceAlpha;",
+            "uniform float fresnelPower;",
         ].join("\n"),
 
         mixer: function(morphs) {
@@ -657,6 +659,19 @@ var Shaderlib = (function() {
                 "gl_FragColor = tColor + (1.-tColor.a)*gl_FragColor;",
             "#endif",
                 THREE.ShaderChunk[ "lights_phong_fragment" ],
+                // Ghost hull. A flat alpha reads as fog -- it dims everything
+                // evenly and the folds stop being legible. Fresnel instead leaves
+                // the surface nearly clear where it faces the camera and opaque at
+                // grazing angles, so the silhouette and the sulcal walls survive
+                // while you see through the crown into the interior. Adapted from
+                // a hand-written three.js viewer that solves the same problem;
+                // there it rides on MeshPhysicalMaterial via onBeforeCompile,
+                // which this three.js (r69) predates, so it goes in by hand.
+                // Placed after the lighting chunk so only alpha is touched.
+                "if (surfaceAlpha < 1.) {",
+                    "float fres = pow(1. - clamp(dot(normalize(vViewPosition), normalize(vNormal)), 0., 1.), fresnelPower);",
+                    "gl_FragColor.a *= mix(surfaceAlpha * 0.25, min(surfaceAlpha * 1.8, 1.), fres);",
+                "}",
     "#endif",
             "}"
             ].join("\n");
@@ -858,6 +873,19 @@ var Shaderlib = (function() {
                 "gl_FragColor = tColor + (1.-tColor.a)*gl_FragColor;",
             "#endif",
                 THREE.ShaderChunk[ "lights_phong_fragment" ],
+                // Ghost hull. A flat alpha reads as fog -- it dims everything
+                // evenly and the folds stop being legible. Fresnel instead leaves
+                // the surface nearly clear where it faces the camera and opaque at
+                // grazing angles, so the silhouette and the sulcal walls survive
+                // while you see through the crown into the interior. Adapted from
+                // a hand-written three.js viewer that solves the same problem;
+                // there it rides on MeshPhysicalMaterial via onBeforeCompile,
+                // which this three.js (r69) predates, so it goes in by hand.
+                // Placed after the lighting chunk so only alpha is touched.
+                "if (surfaceAlpha < 1.) {",
+                    "float fres = pow(1. - clamp(dot(normalize(vViewPosition), normalize(vNormal)), 0., 1.), fresnelPower);",
+                    "gl_FragColor.a *= mix(surfaceAlpha * 0.25, min(surfaceAlpha * 1.8, 1.), fres);",
+                "}",
             "}"
             ].join("\n");
 
