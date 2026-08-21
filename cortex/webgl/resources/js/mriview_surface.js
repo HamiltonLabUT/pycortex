@@ -345,6 +345,49 @@ var mriview = (function(module) {
         }.bind(this), {useWorker:true});
     };
     THREE.EventDispatcher.prototype.apply(module.Surface.prototype);
+
+    // Data attributes as long as the surface is wide, for a dataview that fills
+    // none of them.
+    //
+    // The geometry is loaded with `data0`..`data3` and `nanmask` empty, and
+    // filling them is the dataview's business -- but not every dataview has
+    // anything to put there. An electrode view never does: its values are
+    // indexed by contact, the markers carry them, and `ElectrodeData.set`
+    // dispatches nothing. Every other kind leaves them empty until its array
+    // arrives over the wire. Either way the draw calls in the meantime bind a
+    // zero-byte buffer for an attribute the shader reads, and WebGL rejects the
+    // whole call -- INVALID_OPERATION, "Vertex buffer is not big enough for the
+    // draw call" -- so the cortex vanishes while the electrode markers, which
+    // are meshes of their own, keep drawing.
+    //
+    // Zeros are the right filler rather than merely a safe one. A scalar view
+    // reads `nanmask` as 0 and discards the data layer; an RGB view reads the
+    // fourth component as alpha and composites nothing. Both leave the
+    // curvature showing, which is what a cortex carrying no data looks like.
+    module.Surface.prototype._blankDataAttributes = function(dataview) {
+        // An electrode view is blanked every time, not just when the attributes
+        // are too short: switching to one from a vertex view would otherwise
+        // leave the previous dataset's values painted under the markers.
+        var always = dataview.electrode === true;
+        var width = dataview.data[0].raw ? 4 : 1;
+        var sizes = {data0:width, data1:width, data2:width, data3:width, nanmask:1};
+        for (var name in this.hemis) {
+            var hemi = this.hemis[name];
+            var pos = hemi.attributes.position;
+            var nverts = pos.array.length / pos.itemSize;
+            for (var attr in sizes) {
+                var current = hemi.attributes[attr];
+                if (!always && current !== undefined &&
+                        current.length >= nverts * sizes[attr])
+                    continue;   // real data, dispatched by the dataview
+                var blank = new THREE.BufferAttribute(
+                    new Float32Array(nverts * sizes[attr]), sizes[attr]);
+                blank.needsUpdate = true;
+                hemi.attributes[attr] = blank;
+            }
+        }
+    };
+
     module.Surface.prototype.resize = function(evt) {
     //     this.volumebuf = new THREE.WebGLRenderTarget(width, height, {
     //         minFilter: THREE.LinearFilter,
@@ -366,6 +409,7 @@ var mriview = (function(module) {
         this._active = dataview;
 
         this.loaded.done(function() {
+            this._blankDataAttributes(dataview);
             var shaders = [];
             // Halo rendering code, ignore for now
             // if (this.sheets.length > 1) { //setup meshes for halo rendering
