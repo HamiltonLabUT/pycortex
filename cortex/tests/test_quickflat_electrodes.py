@@ -257,3 +257,169 @@ def test_make_figure_is_unchanged_when_the_flag_is_off(eset):
     fig = cortex.quickflat.make_figure(view, with_rois=False, with_colorbar=False)
     assert len(fig.gca().collections) == 0
     plt.close(fig)
+
+
+# -- an Electrode view as the thing being drawn -----------------------------
+#
+# P2 made electrode data a real Dataview, so the two entry points below are
+# what "plot my electrode data" now means. `add_electrodes` gains a view that
+# carries its own values and colormap, and `make_figure` gains a branch for the
+# case where electrode data is the *subject* of the figure rather than an
+# annotation over somebody else's.
+
+
+@pytest.fixture
+def montage(eset, tmp_path, monkeypatch):
+    """`eset`, saved as S1's native montage in a scratch filestore.
+
+    A scratch one because these tests write, and the real filestore is checked
+    into the repo. The surfaces still come from the real S1 -- the anchors were
+    computed against them in `eset` and are carried in the file.
+    """
+    import os
+    import shutil
+
+    real = cortex.db.filestore
+    for entry in os.listdir(os.path.join(real, SUBJECT)):
+        src = os.path.join(real, SUBJECT, entry)
+        dst = str(tmp_path / SUBJECT / entry)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        (shutil.copytree if os.path.isdir(src) else shutil.copy)(src, dst)
+
+    monkeypatch.setattr(cortex.db, "filestore", str(tmp_path))
+    cortex.db.reload_subjects()
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    yield cortex.db
+    cortex.db.reload_subjects()
+
+
+@pytest.fixture
+def view(montage, eset):
+    return cortex.Electrode(
+        np.linspace(0.0, 1.0, len(eset)), SUBJECT, "native",
+        cmap="viridis", vmin=0.0, vmax=1.0,
+    )
+
+
+def test_a_view_supplies_its_own_values_and_colormap(flatfig, view):
+    """Which is the point of the view existing: one object, not four arguments."""
+    collections = add_electrodes(flatfig, view)
+    drawn = [c for c in collections.values() if c.get_array() is not None]
+    assert drawn, "markers should be colormapped, not flat-coloured"
+    for coll in drawn:
+        assert coll.cmap.name == "viridis"
+        assert (coll.norm.vmin, coll.norm.vmax) == (0.0, 1.0)
+
+
+def test_an_explicit_argument_still_beats_the_view(flatfig, view):
+    collections = add_electrodes(flatfig, view, cmap="hot", vmax=0.5)
+    coll = next(c for c in collections.values() if c.get_array() is not None)
+    assert coll.cmap.name == "hot"
+    assert coll.norm.vmax == 0.5
+    assert coll.norm.vmin == 0.0     # the one not overridden still comes from the view
+
+
+def test_a_view_and_its_set_draw_the_same_markers(flatfig, view, eset):
+    from_view = _offsets(add_electrodes(flatfig, view))
+    from_set = _offsets(add_electrodes(flatfig, eset, values=view.data))
+    assert np.allclose(from_view, from_set)
+
+
+def test_a_movie_view_draws_its_first_frame(flatfig, montage, eset):
+    """As `add_data` takes the first frame of an image: a figure is one instant."""
+    frames = np.tile(np.arange(float(len(eset))), (4, 1))
+    collections = add_electrodes(flatfig, cortex.Electrode(frames, SUBJECT, "native"))
+    # One collection per marker shape, so gather them all before comparing.
+    drawn = np.concatenate([np.asarray(c.get_array()) for c in collections.values()])
+    assert np.allclose(np.sort(drawn), frames[0])
+
+
+def test_a_2d_view_brings_finished_colours_rather_than_a_scale(flatfig, montage, eset):
+    """It has already colormapped itself, so there is nothing left to map.
+
+    The markers therefore carry per-contact RGBA and no norm -- and so no
+    colorbar, which is right: a 2D colormap has no one-dimensional scale to show.
+    """
+    n = len(eset)
+    twod = cortex.Electrode2D(np.arange(float(n)), np.arange(float(n))[::-1],
+                              SUBJECT, "native")
+    collections = add_electrodes(flatfig, twod)
+    assert all(c.get_array() is None for c in collections.values())
+    faces = np.vstack([c.get_facecolors() for c in collections.values()])
+    assert faces.shape[1] == 4
+    assert len(np.unique(faces, axis=0)) > 1     # not one colour repeated
+
+
+def test_something_that_is_neither_a_set_nor_a_view_is_rejected(flatfig):
+    with pytest.raises(TypeError, match="ElectrodeSet or a cortex.Electrode"):
+        add_electrodes(flatfig, "not electrodes")
+
+
+# -- make_figure with electrode data as the primary view --------------------
+
+
+def test_electrode_data_can_be_the_figure(view):
+    """`make_figure(elec)` draws the contacts, with no `add_data` call.
+
+    An `Electrode` is a `RenderableView` like any other, so `as_renderable`
+    accepts it -- but its array is one value per contact, and handing that to
+    `make_flatmap_image` would index the flatmap cache with a few hundred values.
+    The branch is what turns that into the intended picture.
+    """
+    fig = cortex.quickflat.make_figure(view, with_rois=False)
+    try:
+        ax = fig.get_axes()[0]
+        markers = [c for c in ax.collections if c.get_label() == "electrodes"]
+        assert markers
+        assert sum(len(c.get_offsets()) for c in markers) > 0
+        assert next(c for c in markers if c.get_array() is not None).cmap.name == "viridis"
+    finally:
+        plt.close(fig)
+
+
+def test_an_electrode_figure_draws_curvature_without_being_asked(view):
+    """Markers on a blank page say nothing, so the default flips for this kind.
+
+    `with_curvature` defaults to None -- "not asked about" -- rather than False,
+    so this can differ by data kind while an explicit False still wins.
+    """
+    fig = cortex.quickflat.make_figure(view, with_rois=False)
+    plain = cortex.quickflat.make_figure(view, with_rois=False, with_curvature=False)
+    try:
+        assert len(fig.get_axes()[0].get_images()) == 1
+        assert len(plain.get_axes()[0].get_images()) == 0
+    finally:
+        plt.close(fig)
+        plt.close(plain)
+
+
+def test_an_electrode_figure_gets_a_colorbar_from_its_markers(view):
+    """There being no image to take one from."""
+    fig = cortex.quickflat.make_figure(view, with_rois=False, with_colorbar=True)
+    bare = cortex.quickflat.make_figure(view, with_rois=False, with_colorbar=False)
+    try:
+        assert len(fig.get_axes()) == len(bare.get_axes()) + 1
+    finally:
+        plt.close(fig)
+        plt.close(bare)
+
+
+def test_other_data_still_draws_no_curvature_and_no_electrodes_by_default():
+    """The two flipped defaults are scoped to electrode data and nothing else."""
+    fig = cortex.quickflat.make_figure(
+        cortex.Vertex.random(SUBJECT), with_rois=False, with_colorbar=False
+    )
+    try:
+        ax = fig.get_axes()[0]
+        assert [c for c in ax.collections if c.get_label() == "electrodes"] == []
+        assert len(ax.get_images()) == 1        # the data layer, not curvature
+    finally:
+        plt.close(fig)
+
+
+def test_a_png_of_electrode_data_is_written(view, tmp_path):
+    """`make_png` forwards **kwargs, so it follows `make_figure` for free."""
+    out = str(tmp_path / "elec.png")
+    cortex.quickflat.make_png(out, view, with_rois=False)
+    import os
+    assert os.path.getsize(out) > 1000

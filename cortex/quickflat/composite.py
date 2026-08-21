@@ -1,7 +1,8 @@
 import copy
-from typing import TYPE_CHECKING, Any, Optional, Union, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Union, Sequence, cast
 
 from matplotlib.axes import Axes
+from matplotlib.cm import ScalarMappable
 from matplotlib.collections import LineCollection, PathCollection
 from matplotlib.typing import ColorType
 from matplotlib.figure import Figure
@@ -18,6 +19,8 @@ from ..database import db
 from ..options import config
 
 if TYPE_CHECKING:
+    from ..dataset import Electrode
+    from ..dataset.views import ElectrodeView
     from ..electrodes import ElectrodeSet
 
 
@@ -343,17 +346,18 @@ def add_hatch(fig: Axes, hatch_data: dataset.Dataview, extents: Optional[tuple[f
     return img
 
 
-def add_colorbar(fig: Figure, cimg: AxesImage, colorbar_ticks: Optional[npt.ArrayLike]=None, colorbar_location: tuple[float, float, float, float]=(0.4, 0.07, 0.2, 0.04),
+def add_colorbar(fig: Union[Figure, Axes], cimg: ScalarMappable, colorbar_ticks: Optional[npt.ArrayLike]=None, colorbar_location: tuple[float, float, float, float]=(0.4, 0.07, 0.2, 0.04),
                  orientation: str='horizontal') -> Axes:
     """Add a colorbar to a flatmap plot
 
     Parameters
     ----------
-    fig : matplotlib Figure object
+    fig : matplotlib Figure or Axes object
         Figure into which to insert colormap
-    cimg : matplotlib.image.AxesImage object
-        Image for which to create colorbar. For reference, matplotlib.image.AxesImage 
-        is the output of imshow()
+    cimg : matplotlib ScalarMappable
+        The thing for which to create a colorbar -- an ``AxesImage`` from
+        ``imshow`` for image data, or the ``PathCollection`` from ``scatter``
+        for electrode markers, which have no image to take a scale from.
     colorbar_ticks : array-like
         values for colorbar ticks
     colorbar_location : array-like
@@ -692,12 +696,13 @@ MARKER_BY_GROUP_TYPE = {
 DEFAULT_MARKER = "o"
 
 
-def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLike]=None,
+def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
+                   values: Optional[npt.ArrayLike]=None,
                    subject: Optional[str]=None,
                    depth: Optional[Union[float, tuple[float, float]]]=None,
                    depth_tol: float=0.25, placeable_only: bool=True,
                    cmap: Optional[str]=None, vmin: Optional[float]=None, vmax: Optional[float]=None,
-                   color: Optional[ColorType]=None,
+                   color: Optional[Union[ColorType, npt.NDArray]]=None,
                    size: float=36.0, size_by: Optional[str]=None,
                    size_range: tuple[float, float]=(12.0, 110.0),
                    marker: Optional[Union[str, dict]]=None,
@@ -713,13 +718,18 @@ def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLi
     ----------
     fig : figure or ax
         figure into which to plot the electrodes
-    electrodes : cortex.electrodes.ElectrodeSet
-        The electrodes to draw. Anchored in place if it is not already, which
+    electrodes : cortex.electrodes.ElectrodeSet or cortex.Electrode
+        The electrodes to draw. Anchored in place if they are not already, which
         needs the set to know its subject.
+
+        An :class:`cortex.Electrode` view carries its own values, colormap,
+        bounds and subject, so passing one supplies ``values``, ``cmap``,
+        ``vmin``, ``vmax`` and ``subject`` at once. Any of those given
+        explicitly still wins.
     values : array-like, optional
         One value per electrode, colormapped through ``cmap``. Length must match
         the *whole* set, before any filtering below. None draws every marker in
-        ``color``.
+        ``color`` -- unless ``electrodes`` is a view, whose data is then used.
     subject : str, optional
         The subject the figure belongs to. When given, it must match the
         electrode set's own subject. Worth passing: electrodes from the wrong
@@ -788,12 +798,37 @@ def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLi
     it, but a marker inside the cutout's bounding box and outside its outline
     will still be drawn.
     """
-    from ..electrodes import ElectrodeSet  # noqa: F401  (runtime type check below)
+    from ..dataset import Electrode
+    from ..dataset.views import ElectrodeView
+    from ..electrodes import ElectrodeSet
+
+    # An Electrode view is an electrode set plus the four things this function
+    # would otherwise have to be told separately, so unpack it into them. Doing
+    # it here rather than in the caller means `make_figure` and a direct call get
+    # the same behaviour, and an explicit argument still wins -- passing
+    # `cmap=` alongside a view overrides the view's, which is what someone
+    # reaching for the override expects.
+    if isinstance(electrodes, ElectrodeView):
+        view = electrodes
+        electrodes = view.electrodes
+        subject = view.subject if subject is None else subject
+        if isinstance(view, Electrode):
+            if values is None:
+                values = view.data[0] if view.movie else view.data
+            cmap = view.cmap if cmap is None else cmap
+            vmin = view.vmin if vmin is None else vmin
+            vmax = view.vmax if vmax is None else vmax
+        elif color is None:
+            # A 2D or RGB view has already resolved its own colours -- through a
+            # 2D colormap, or from three channels and an alpha -- so there is no
+            # scale left to map. Take the finished RGBA per contact, first frame
+            # for a movie, as `add_data` takes the first frame of an image.
+            color = view.raw.renderer_data[0] / 255.0
 
     if not isinstance(electrodes, ElectrodeSet):
         raise TypeError(
-            "add_electrodes needs a cortex.electrodes.ElectrodeSet, got %s"
-            % type(electrodes).__name__
+            "add_electrodes needs a cortex.electrodes.ElectrodeSet or a "
+            "cortex.Electrode, got %s" % type(electrodes).__name__
         )
     if subject is not None and electrodes.subject not in (None, subject):
         raise ValueError(
@@ -873,7 +908,14 @@ def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLi
             alpha=alpha, zorder=zorder, label="electrodes", **kwargs,
         )
         if values_arr is None:
-            scatter_kws["c"] = [color] * int(sel.sum())
+            # One colour repeated, or one per contact already -- the latter is
+            # what a 2D or RGB electrode view supplies, having colormapped
+            # itself.
+            scatter_kws["c"] = (
+                cast(npt.NDArray, color)[keep][sel]
+                if _is_per_contact_color(color)
+                else [color] * int(sel.sum())
+            )
         else:
             scatter_kws.update(c=values_arr[sel], cmap=cmap, norm=norm)
         collections[shape] = ax.scatter(positions[sel, 0], positions[sel, 1], **scatter_kws)
@@ -885,6 +927,17 @@ def add_electrodes(fig, electrodes: "ElectrodeSet", values: Optional[npt.ArrayLi
                         fontsize=labelsize, color=labelcolor, zorder=zorder + 1)
 
     return collections
+
+
+def _is_per_contact_color(color: Any) -> bool:
+    """Whether ``color`` is one RGB(A) row per contact rather than one colour.
+
+    An ``(n, 3)`` or ``(n, 4)`` array is ambiguous in principle -- four contacts
+    and one RGBA tuple are both length four -- but not here: a single colour
+    reaching this function is whatever the caller passed for every marker, and
+    matplotlib spells that as a tuple or a string, never as a 2-D array.
+    """
+    return isinstance(color, np.ndarray) and color.ndim == 2
 
 
 def _electrode_markers(electrodes: "ElectrodeSet",

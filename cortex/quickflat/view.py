@@ -4,7 +4,7 @@ import tempfile
 import binascii
 import numpy as np
 import numpy.typing as npt
-from typing import IO, TYPE_CHECKING, BinaryIO, Mapping, Optional, Sequence, Union
+from typing import IO, TYPE_CHECKING, BinaryIO, Mapping, Optional, Sequence, Union, cast
 
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
@@ -15,10 +15,11 @@ from .. import dataset, utils
 from ..database import db
 from ..dataset.views import as_renderable
 from ..dataset.view2D import Dataview2D
-from ..dataset.views import ScalarView, VolumetricView
-from .utils import make_flatmap_image
+from ..dataset.views import ElectrodeView, ScalarView, VolumetricView
+from .utils import get_flatmask, make_flatmap_image
 
 if TYPE_CHECKING:
+    from ..dataset import Electrode
     from ..electrodes import ElectrodeSet
 
 
@@ -43,21 +44,25 @@ def _check_colorbar_location(colorbar_location: Union[tuple[float, float, float,
 def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: bool=True, thick: int=32, sampler: str='nearest',
                 height: int=1024, dpi: int=100, depth: float=0.5, with_rois: bool=True, with_sulci: bool=False,
                 with_labels: bool=True, with_colorbar: bool=True, with_borders: bool=False,
-                with_dropout: Union[bool, float]=False, with_curvature: bool=False, extra_disp: Optional[tuple[str, str]]=None,
+                with_dropout: Union[bool, float]=False, with_curvature: Optional[bool]=None, extra_disp: Optional[tuple[str, str]]=None,
                 with_connected_vertices: bool=False, overlay_file: Optional[str]=None,
                 linewidth: Optional[int]=None, linecolor: Optional[ColorType]=None, roifill: Optional[ColorType]=None, shadow: Optional[int]=None,
                 labelsize: Optional[str]=None, labelcolor: Optional[ColorType]=None, cutout: Optional[str]=None, curvature_brightness: Optional[float]=None,
                 curvature_contrast: Optional[float]=None, curvature_threshold: Optional[bool]=None, fig: Optional[Union[Figure, Axes]]=None, extra_hatch: Optional[tuple[dataset.Dataview, tuple[float, float, float]]]=None,
                 colorbar_ticks: Optional[npt.ArrayLike]=None, colorbar_location: Union[tuple[float, float, float, float], str]='center', roi_list: Optional[Sequence[str]]=None, sulci_list: Optional[Sequence[str]]=None,
-                nanmean: bool=False, with_electrodes: Union[bool, str, "ElectrodeSet"]=False,
+                nanmean: bool=False,
+                with_electrodes: Union[bool, str, "ElectrodeSet", "Electrode", None]=None,
                 electrode_values: Optional[npt.ArrayLike]=None,
                 electrode_kwargs: Optional[dict]=None) -> Figure:
     """Show a Volume or Vertex on a flatmap with matplotlib.
 
     Parameters
     ----------
-    braindata : Dataview (e.g. instance of cortex.Volume, cortex.Vertex,...)
-        the data you would like to plot on a flatmap
+    braindata : Dataview (e.g. instance of cortex.Volume, cortex.Vertex,
+        cortex.Electrode, ...)
+        the data you would like to plot on a flatmap. Electrode data is drawn as
+        coloured markers over the curvature rather than as an image layer, since
+        its array is indexed by contact rather than by any part of the map.
     recache : boolean
         Whether or not to recache intermediate files. Takes longer to plot this way, potentially
         resolves some errors. Useful if you've made changes to the alignment
@@ -75,19 +80,30 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
         Value between 0 and 1 for how deep to sample the surface for the flatmap (0 = gray/white matter
         boundary, 1 = pial surface)
     with_rois, with_labels, with_colorbar, with_borders, with_dropout, with_curvature, etc : bool, optional
-        Display the rois, labels, colorbar, annotated flatmap borders, etc
+        Display the rois, labels, colorbar, annotated flatmap borders, etc.
+        ``with_curvature`` defaults to None, which draws curvature only for
+        electrode data -- markers over a blank figure convey nothing, while
+        every other kind of data already fills the map.
     cutout : str
         Name of flatmap cutout with which to clip the full flatmap. Should be the name
         of a sub-layer of the 'cutouts' layer in <filestore>/<subject>/overlays.svg
     sulci_list : list
         List of sulci to include
-    with_electrodes : bool, str or ElectrodeSet, optional
+    with_electrodes : bool, str, ElectrodeSet, Electrode or None, optional
         Draw intracranial electrodes over the flatmap. True loads the subject's
-        default set from the filestore, a string names one of several sets, and
-        an :class:`~cortex.electrodes.ElectrodeSet` is used as given. Drawn last,
-        so a cutout has already reset the axis limits.
+        default set from the filestore, a string names one of several sets, an
+        :class:`~cortex.electrodes.ElectrodeSet` is used as given, and a
+        :class:`cortex.Electrode` additionally supplies the values and colormap
+        to draw them with. Drawn last, so a cutout has already reset the axis
+        limits.
+
+        None, the default, means "whatever suits this figure": nothing for
+        volumetric or surface data, and the data itself when ``braindata`` is
+        electrode data.
     electrode_values : array-like, optional
-        One value per electrode, colormapped onto the markers.
+        One value per electrode, colormapped onto the markers. Not needed when
+        ``with_electrodes`` is an :class:`cortex.Electrode`, which carries its
+        own.
     electrode_kwargs : dict, optional
         Passed to :func:`cortex.quickflat.composite.add_electrodes` -- ``depth``,
         ``marker``, ``size_by``, ``cmap`` and the rest.
@@ -166,10 +182,31 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
         fig = ax.figure
 
     # Add data
-    data_im, extents = composite.add_data(ax, dataview, pixelwise=pixelwise, thick=thick, sampler=sampler,
-                                          height=height, depth=depth, recache=recache, nanmean=nanmean)
+    #
+    # Electrode data is not an image layer. Its array is one value per contact
+    # -- a few hundred entries where the flatmap cache expects a few hundred
+    # thousand -- so there is nothing for `add_data` to sample, and the contacts
+    # are drawn as markers further down instead. All this branch owes is the
+    # extents that `add_data` would otherwise have returned, plus a brain to draw
+    # them over: a figure of markers on white says nothing, so curvature is on by
+    # default here rather than off.
+    electrode_primary = isinstance(dataview, ElectrodeView)
 
-    layers = dict(data=data_im)
+    # `None` on these two means "not asked about", which is not the same as
+    # "asked for off" -- an electrode figure wants both on and any other figure
+    # wants both off, and someone who passes False still gets False.
+    if with_curvature is None:
+        with_curvature = electrode_primary
+    if with_electrodes is None:
+        with_electrodes = dataview if electrode_primary else False
+
+    if electrode_primary:
+        _, extents = get_flatmask(dataview.subject, height=height, recache=recache)
+        layers = {}
+    else:
+        data_im, extents = composite.add_data(ax, dataview, pixelwise=pixelwise, thick=thick, sampler=sampler,
+                                              height=height, depth=depth, recache=recache, nanmean=nanmean)
+        layers = dict(data=data_im)
     # Add curvature
     if with_curvature:
         curv_im = composite.add_curvature(ax, dataview, extents,
@@ -245,8 +282,12 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
     ax.set_ylim(extents[2], extents[3])
 
     if fig_resize:
-        imsize = fig.get_axes()[0].get_images()[0].get_size()
-        fig.set_size_inches(np.array(imsize)[::-1] / float(dpi))
+        # An electrode figure with curvature turned off has no image layer at
+        # all, so there is nothing to take a size from; the figure keeps
+        # matplotlib's default and the axis limits still frame the flatmap.
+        images = fig.get_axes()[0].get_images()
+        if images:
+            fig.set_size_inches(np.array(images[0].get_size())[::-1] / float(dpi))
 
     # Add (apply) cutout of flatmap
     if cutout is not None:
@@ -256,19 +297,36 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
     # layers, so `add_cutout` cannot clip them and would choke on them if they were
     # in `layers`. Drawing them here means the cutout's axis limits clip them
     # instead.
+    markers: dict = {}
     if with_electrodes is not False:
-        electrodes = with_electrodes
-        if electrodes is True or isinstance(electrodes, str):
-            name = "electrodes" if electrodes is True else electrodes
+        electrodes = cast(Union["ElectrodeSet", "Electrode"], with_electrodes)
+        if with_electrodes is True or isinstance(with_electrodes, str):
+            name = "electrodes" if with_electrodes is True else with_electrodes
             electrodes = db.get_electrodes(dataview.subject, name=name)
-        composite.add_electrodes(ax, electrodes, values=electrode_values,
-                                 subject=dataview.subject,
-                                 **(electrode_kwargs or {}))
+        markers = composite.add_electrodes(ax, electrodes, values=electrode_values,
+                                           subject=dataview.subject,
+                                           **(electrode_kwargs or {}))
 
     if with_colorbar:
         colorbar_location = _check_colorbar_location(colorbar_location)
         # Allow 2D colorbars:
-        if isinstance(dataview, dataset.Dataview2D):
+        if electrode_primary and not isinstance(dataview, dataset.Dataview2D):
+            # The markers are the mappable here, there being no image. They come
+            # back one collection per marker shape, all sharing the norm and
+            # colormap, so any of them describes the scale -- and none of them
+            # does if nothing was drawn (every contact filtered out, or an RGB
+            # view, which carries its own colours and has no scale to show).
+            mappable = next(
+                (m for m in markers.values() if m.get_array() is not None), None
+            )
+            colorbar = (
+                None if mappable is None
+                else composite.add_colorbar(
+                    ax, mappable, colorbar_location=colorbar_location,
+                    colorbar_ticks=colorbar_ticks,
+                )
+            )
+        elif isinstance(dataview, dataset.Dataview2D):
             colorbar_ticks = np.round([
                     dataview.vmin, dataview.vmax,
                     dataview.vmin2, dataview.vmax2
