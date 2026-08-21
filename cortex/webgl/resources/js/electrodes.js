@@ -96,6 +96,10 @@ var electrodes = (function(module) {
                 name:       contact.name,
                 group:      contact.group,
                 group_type: contact.group_type,
+                anatomy:    contact.anatomy,
+                status:     contact.status,
+                placement:  contact.placement,
+                size:       contact.size,
                 depth:      contact.depth,
                 depth_mm:   contact.depth_mm,
                 thickness:  contact.thickness_mm,
@@ -105,13 +109,20 @@ var electrodes = (function(module) {
         this._buildLabels();
         this._bindHover();
 
+        this._buildFilters();
+        this._bindClick();
+
         this.ui = (new jsplot.Menu()).add({
             visible: {action:[this, "setVisible"]},
             radius:  {action:[this, "setRadius", 0.5, 6.0]},
             lift:    {action:[this, "setLift", 0.0, 4.0]},
             labels:  {action:[this, "setLabels"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
+            shape: {action:[this, "setShape", ["sphere", "cube", "diamond"]]},
+            size_by_diameter: {action:[this, "setSizeByDiameter"]},
         });
+        if (this._filterFields.length)
+            this.ui.addFolder("filter", true, this.filterUI);
     }
 
     // Re-place every marker for the current inflation and depth. Called on each
@@ -141,7 +152,7 @@ var electrodes = (function(module) {
             if (t <= 0) {
                 // Anatomical surface: every contact is at its measured position,
                 // so there is no "sampled depth" to be near or far from.
-                contact.mesh.visible = this._visible;
+                contact.mesh.visible = this._visible && this._passesFilters(contact);
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
@@ -152,7 +163,7 @@ var electrodes = (function(module) {
             // drawn. Hide it rather than project it onto a surface it is not
             // near, which is the same reasoning as the placement policy: draw
             // what is there, not what would look tidy.
-            contact.mesh.visible = this._visible && this._nearSampledDepth(contact, evt.thickmix);
+            contact.mesh.visible = this._visible && this._passesFilters(contact) && this._nearSampledDepth(contact, evt.thickmix);
             if (!contact.mesh.visible)
                 continue;
 
@@ -445,6 +456,176 @@ var electrodes = (function(module) {
 
     module.Electrodes.prototype.hovered = function() {
         return this._hovered === null ? "" : this._hovered.name;
+    };
+
+    // -- filtering -----------------------------------------------------------
+    //
+    // Dropdowns are built from the values this montage actually contains, so a
+    // file with no anatomy column gets no anatomy filter rather than an empty
+    // one. Filters compose: each is null for "no restriction", and a contact has
+    // to pass all of them.
+    // -- click-through metadata ----------------------------------------------
+    //
+    // Bound on mouseup rather than click, and only when the pointer has barely
+    // moved: dragging to rotate the brain ends on whatever mesh it started from
+    // and would otherwise open the panel every time you turned the head.
+    module.Electrodes.prototype._bindClick = function() {
+        var brain = $("#brain");
+        brain.on("mousedown.electrodes", function(evt) {
+            this._downAt = {x: evt.pageX, y: evt.pageY};
+        }.bind(this));
+        brain.on("mouseup.electrodes", function(evt) {
+            var d = this._downAt;
+            this._downAt = null;
+            if (!d || Math.abs(evt.pageX - d.x) > 4 || Math.abs(evt.pageY - d.y) > 4)
+                return;                      // that was a drag, not a click
+            var el = $("#brain"), off = el.offset();
+            this.select(this._pickNDC(
+                ((evt.pageX - off.left) / el.width()) * 2 - 1,
+                -((evt.pageY - off.top) / el.height()) * 2 + 1
+            ));
+        }.bind(this));
+    };
+
+    module.Electrodes.prototype.select = function(contact) {
+        this._selected = contact || null;
+        var panel = $("#electrode_info");
+        if (!panel.length)
+            return this.selected();
+        if (this._selected === null) {
+            panel.css("display", "none");
+            return "";
+        }
+
+        // Only the fields this montage actually carries. A row reading
+        // "anatomy: --" is worse than no row: it looks like missing data rather
+        // than like a column the file never had.
+        var rows = [["electrode", contact.name]];
+        if (this.subject) rows.push(["participant", this.subject]);
+        var optional = [["group", contact.group], ["type", contact.group_type],
+                        ["anatomy", contact.anatomy], ["status", contact.status]];
+        for (var i = 0; i < optional.length; i++)
+            if (optional[i][1]) rows.push(optional[i]);
+        if (contact.depth_mm !== null && contact.depth_mm !== undefined)
+            rows.push(["depth", contact.depth_mm.toFixed(1) + " mm from pia"]);
+        if (contact.placement)
+            rows.push(["placement", contact.placement.replace(/_/g, " ")]);
+        if (contact.value !== null && contact.value !== undefined)
+            rows.push(["value", (+contact.value).toPrecision(4)]);
+
+        var html = "";
+        for (var i = 0; i < rows.length; i++)
+            html += "<div class='erow'><span class='ekey'>" + rows[i][0] +
+                    "</span><span class='eval'>" + rows[i][1] + "</span></div>";
+        panel.html(html).css("display", "block");
+        return contact.name;
+    };
+
+    module.Electrodes.prototype.selected = function() {
+        return this._selected ? this._selected.name : "";
+    };
+
+    // Select from normalised coordinates, as a click would. Keeps the panel
+    // testable without synthesising DOM events.
+    module.Electrodes.prototype.selectAt = function(x, y) {
+        return this.select(this._pickNDC(x, y));
+    };
+
+    module.Electrodes.prototype._distinct = function(field) {
+        var seen = {}, out = [];
+        for (var i = 0; i < this.contacts.length; i++) {
+            var v = this.contacts[i][field];
+            if (v && seen[v] === undefined) {
+                seen[v] = true;
+                out.push(v);
+            }
+        }
+        return out.sort();
+    };
+
+    module.Electrodes.prototype._buildFilters = function() {
+        this.filters = {group: null, group_type: null, anatomy: null, status: null};
+        this.filterUI = new jsplot.Menu();
+        this._filterFields = [];
+
+        var fields = [["group", "group"], ["group_type", "type"],
+                      ["anatomy", "anatomy"], ["status", "status"]];
+        for (var i = 0; i < fields.length; i++) {
+            var field = fields[i][0], label = fields[i][1];
+            // The setter exists for every field, whatever this montage
+            // contains, so the API does not change shape with the data. Only
+            // the *dropdown* is conditional -- one distinct value is nothing to
+            // choose between, and an empty menu is clutter.
+            this._makeFilterSetter(field);
+            var values = this._distinct(field);
+            if (values.length < 2)
+                continue;
+            var desc = {};
+            desc[label] = {action: [this, "filter_" + field, ["all"].concat(values)]};
+            this.filterUI.add(desc);
+            this._filterFields.push(field);
+        }
+    };
+
+    // dat.GUI binds one control to one named method, so each field needs its
+    // own setter. Generated rather than written out four times.
+    module.Electrodes.prototype._makeFilterSetter = function(field) {
+        this["filter_" + field] = function(val) {
+            if (val === undefined)
+                return this.filters[field] === null ? "all" : this.filters[field];
+            this.filters[field] = (val === "all") ? null : val;
+            this._refresh();
+        }.bind(this);
+    };
+
+    module.Electrodes.prototype._passesFilters = function(contact) {
+        for (var field in this.filters) {
+            var want = this.filters[field];
+            if (want !== null && contact[field] !== want)
+                return false;
+        }
+        return true;
+    };
+
+    // How many contacts are currently drawn. A plain number, so it survives the
+    // trip to python and a test can assert on it.
+    module.Electrodes.prototype.countVisible = function() {
+        var n = 0;
+        for (var i = 0; i < this.contacts.length; i++)
+            if (this.contacts[i].mesh.visible) n++;
+        return n;
+    };
+
+    // -- appearance ----------------------------------------------------------
+
+    module.Electrodes.prototype.setShape = function(val) {
+        if (val === undefined)
+            return this._shape || module.DEFAULT_SHAPE;
+        this._shape = val;
+        for (var i = 0; i < this.contacts.length; i++) {
+            this.contacts[i].shape = val;
+            this.contacts[i].mesh.geometry = this.geometries[val];
+        }
+    };
+
+    // Scale each marker by its own contact diameter. Off by default: a size
+    // that encodes something is only worth having when the reader knows it does.
+    module.Electrodes.prototype.setSizeByDiameter = function(val) {
+        if (val === undefined)
+            return !!this._sizeByDiameter;
+        this._sizeByDiameter = val;
+        var sizes = [];
+        for (var i = 0; i < this.contacts.length; i++)
+            if (this.contacts[i].size) sizes.push(this.contacts[i].size);
+        sizes.sort(function(a, b) { return a - b; });
+        // Scale around the median, so markers stay the size the radius slider
+        // says whatever millimetre values this lab records.
+        var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 1.0;
+        for (var i = 0; i < this.contacts.length; i++) {
+            var c = this.contacts[i];
+            var scale = (val && c.size) ? (c.size / median) : 1.0;
+            c.mesh.scale.set(scale, scale, scale);
+        }
     };
 
     module.Electrodes.prototype.setLabels = function(val) {

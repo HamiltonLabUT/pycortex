@@ -259,6 +259,62 @@ class TestMarkersInTheViewer:
         # ...and pointing at empty space clears it.
         assert unwrap(e.hoverAt(-0.98, -0.98)) == ""
 
+    def test_filters_compose_and_clear(self):
+        """Each filter is one criterion and a contact has to pass all of them."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        everything = U(e.countVisible())
+        assert everything > 0
+
+        e.filter_group_type("grid")
+        time.sleep(0.5)
+        grids = U(e.countVisible())
+        assert 0 < grids <= everything
+
+        e.filter_group_type("all")
+        time.sleep(0.5)
+        assert U(e.countVisible()) == everything
+
+    def test_shape_and_size_controls(self):
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        e.setShape("cube")
+        time.sleep(0.5)
+        assert U(e.setShape()) == "cube"
+        e.setShape("sphere")
+
+        e.setSizeByDiameter(True)
+        time.sleep(0.5)
+        assert U(e.setSizeByDiameter()) is True
+        e.setSizeByDiameter(False)
+
+    def test_clicking_a_contact_opens_the_metadata_panel(self):
+        """Driven through the real hit test, by projecting a contact to screen
+        coordinates rather than poking the selection in directly."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        xy = U(e.projectContact(0))
+        name = U(e.selectAt(xy[0], xy[1]))
+        assert name, "clicking a projected contact selected nothing"
+        assert U(e.selected()) == name
+        # ...and clicking empty space clears it
+        assert U(e.selectAt(-0.98, -0.98)) == ""
+
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
                   if "[pageerror]" in e]

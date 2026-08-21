@@ -140,6 +140,8 @@ def to_viewer_json(
             "depth_mm": _finite(anchors.depth_mm[i]),
             "thickness_mm": _finite(anchors.thickness_mm[i]),
             "anatomy": str(eset.anatomy[i]),
+            "status": str(eset.status[i]),
+            "size": _finite(eset.size[i]),
             "placement": str(anchors.placement[i]),
         })
 
