@@ -102,6 +102,7 @@ var electrodes = (function(module) {
             });
         }
 
+        this._buildConnections(json);
         this._buildLabels();
         this._bindHover();
 
@@ -110,6 +111,7 @@ var electrodes = (function(module) {
             radius:  {action:[this, "setRadius", 0.5, 6.0]},
             lift:    {action:[this, "setLift", 0.0, 4.0]},
             labels:  {action:[this, "setLabels"]},
+            connections: {action:[this, "setConnections"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
         });
     }
@@ -169,6 +171,7 @@ var electrodes = (function(module) {
                 t >= 1 ? vert.pos : this._raw.lerp(vert.pos, t)
             );
         }
+        this._placeConnections();
         this._placeLabels();
     }
 
@@ -208,6 +211,110 @@ var electrodes = (function(module) {
             mesh.material.needsUpdate = true;
             mesh.renderOrder = val ? 999 : 0;
         }
+        // The lines follow the markers they join: a device half behind
+        // translucent cortex should not come apart at the point its contacts
+        // stop being culled.
+        this.lineMaterial.depthTest = !val;
+        this.lineMaterial.needsUpdate = true;
+        for (var hemi in this.lines)
+            if (this.lines[hemi] !== null)
+                this.lines[hemi].renderOrder = val ? 999 : 0;
+    };
+
+    // -- connection lines ----------------------------------------------------
+    //
+    // A line between contacts that are neighbours on the same device, so a
+    // montage reads as a grid and three shanks rather than as a cloud of dots.
+    // Which pairs those are is decided in python (cortex.electrodes._connect)
+    // from the measured coordinates and arrives as an index list; all this end
+    // does is keep the endpoints on top of the markers as they move.
+    //
+    // One THREE.Line per hemisphere in LinePieces mode -- vertices taken two at
+    // a time as independent segments -- rather than a line per edge, so a
+    // 64-contact grid is one draw call instead of 112. They go into the same
+    // markers group the meshes and labels are in, which is what earns them the
+    // hemisphere separation, the pivot rotation and the flatten flip, and what
+    // makes the electrodes visibility toggle hide them too.
+
+    module.Electrodes.prototype._buildConnections = function(json) {
+        this._connectionsOn = json.connections !== false;
+        this.edges = [];
+        this.lines = {left:null, right:null};
+        this.lineMaterial = new THREE.LineBasicMaterial({
+            color: new THREE.Color(json.line_color === undefined
+                                   ? this.material.color.getHex() : json.line_color),
+            // Thin on purpose, and in any case linewidth above 1 is ignored by
+            // most WebGL implementations.
+            linewidth: 1,
+        });
+
+        var edges = json.edges === undefined ? [] : json.edges;
+        var byHemi = {left:[], right:[]};
+        for (var i = 0; i < edges.length; i++) {
+            var a = this.contacts[edges[i][0]], b = this.contacts[edges[i][1]];
+            // A pair straddling the midline cannot live in either hemisphere's
+            // group, and drawn in one of them it would be attached to a pivot
+            // its far end does not move with.
+            if (a === undefined || b === undefined || a.hemi !== b.hemi)
+                continue;
+            byHemi[a.hemi].push({a:a, b:b, hemi:a.hemi, visible:false});
+        }
+
+        for (var hemi in byHemi) {
+            var hemiEdges = byHemi[hemi];
+            if (hemiEdges.length === 0)
+                continue;
+            var geometry = new THREE.Geometry();
+            for (var i = 0; i < hemiEdges.length; i++) {
+                geometry.vertices.push(new THREE.Vector3(), new THREE.Vector3());
+                hemiEdges[i].vertices = [
+                    geometry.vertices[2 * i], geometry.vertices[2 * i + 1],
+                ];
+                this.edges.push(hemiEdges[i]);
+            }
+            var line = new THREE.Line(geometry, this.lineMaterial, THREE.LinePieces);
+            line.name = "electrode_connections_" + hemi;
+            line.visible = this._connectionsOn;
+            this.lines[hemi] = line;
+            this.markers[hemi].add(line);
+        }
+    };
+
+    // Move every segment onto the markers it joins. Called from setMix once the
+    // contacts have been placed, so it reads positions rather than recomputing
+    // them.
+    module.Electrodes.prototype._placeConnections = function() {
+        if (this.edges === undefined)
+            return;
+        for (var i = 0; i < this.edges.length; i++) {
+            var edge = this.edges[i];
+            edge.visible = edge.a.mesh.visible && edge.b.mesh.visible;
+            edge.vertices[0].copy(edge.a.mesh.position);
+            // A segment whose far end is filtered out by the depth window is
+            // collapsed onto its near end instead of being hidden: r69 draws a
+            // LinePieces geometry as one object and cannot skip a single
+            // segment of it, and a zero-length one rasterises to nothing. Same
+            // reasoning as a label over a hidden marker -- draw what is there.
+            edge.vertices[1].copy(
+                edge.visible ? edge.b.mesh.position : edge.a.mesh.position
+            );
+        }
+        for (var hemi in this.lines) {
+            if (this.lines[hemi] === null)
+                continue;
+            this.lines[hemi].geometry.verticesNeedUpdate = true;
+            this.lines[hemi].visible = this._connectionsOn;
+        }
+    };
+
+    module.Electrodes.prototype.setConnections = function(val) {
+        if (val === undefined)
+            return !!this._connectionsOn;
+        this._connectionsOn = val;
+        for (var hemi in this.lines)
+            if (this.lines[hemi] !== null)
+                this.lines[hemi].visible = val;
+        this.surf.dispatchEvent({type:"update"});
     };
 
     // -- colour from data ---------------------------------------------------
@@ -519,6 +626,19 @@ var electrodes = (function(module) {
                 color: contact.mesh.material.color.getHex(),
                 verts: contact.verts, weights: contact.weights,
                 position: contact.mesh.position.toArray(),
+            };
+        });
+    }
+
+    // Every connection line, for a caller checking which contacts were joined.
+    // Plain values only, so they survive the trip across the python bridge.
+    module.Electrodes.prototype.describeEdges = function() {
+        return this.edges.map(function(edge) {
+            return {
+                a: edge.a.name, b: edge.b.name,
+                group: edge.a.group, hemi: edge.hemi,
+                visible: !!edge.visible,
+                length: edge.a.mesh.position.distanceTo(edge.b.mesh.position),
             };
         });
     }

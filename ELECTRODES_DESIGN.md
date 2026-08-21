@@ -329,6 +329,18 @@ Each phase is independently verifiable and independently useful.
   the anchors ride inside `viewopts`.
 - **P3b** — colours from data, hover tooltip, click-through metadata panel,
   filtering by group and anatomy.
+- **P3c** — *done.* Connection lines: a thin segment between contacts that are
+  neighbours on the same device, with a `connections` checkbox in the electrodes
+  folder, on by default. Not in the original phasing; it belongs beside P3b's
+  "filtering by group", since both are about making a montage read as devices
+  rather than as a cloud of dots.
+
+  Which pairs are neighbours is decided in Python
+  (`cortex/electrodes/_connect.py`) from the measured coordinates, once, and
+  sent as an index list. Deriving it in the browser from the drawn positions
+  would make the topology depend on the inflation slider, with edges appearing
+  and disappearing mid-morph, when the fact being drawn is a property of the
+  physical device. See 6 below for how a grid's lattice is recovered.
 - **P4** — billboards for STRF and evoked data.
 
 ## 3. Decisions taken
@@ -424,7 +436,56 @@ computes for the same set, and separately asserts that the CTM permutation is
 not the identity — because if it ever became one, sending unconverted indices
 would start working by accident and the guard would rot.
 
-## 6. Still to settle
+## 6. A grid's lattice comes from its numbering, not from its spacing
+
+Connection lines need to know which contacts are neighbours, and for a linear
+device that is just the order along the shank. A grid is the hard case, because
+**no format the readers support records a grid's row and column count**. Neither
+BIDS' `electrodes.tsv` nor img_pipe's `elecmatrix` carries one, so a grid
+arrives as nothing more than a set of positions sharing a group name.
+
+The obvious answer -- join contacts closer together than some multiple of the
+median spacing -- does not survive contact with a real montage. A grid conformed
+to a folded surface has no single pitch: it is compressed inside a sulcus and
+stretched over a gyral crown. On the 8x8 test grid draped over S1's lateral
+temporal cortex, the distance to a contact's nearest neighbour ranges from 1.1
+to 9.8 mm, an order of magnitude, against a nominal 8 mm pitch. Any threshold
+that admits the stretched pairs also admits diagonals somewhere else, and a
+tuned one tears holes in the lattice exactly where the cortex bends most --
+measured at 16 of 112 edges missing on that grid.
+
+What does work is remembering that a grid is a **rigid rectangular sheet whose
+contacts are numbered along its rows**. Its lattice is therefore a fact about
+the numbering, and the only unknown is the row width. Recovering one number from
+the geometry is a far steadier question than recovering the whole lattice from
+it, because the candidate answers are few and far apart: the wrong width steps
+sideways along a row instead of down a column, and lands multiples of the pitch
+away. `_connect.py` asks it in two parts --
+
+- the **width**, from the contacts numbered *width* apart, which are the ones
+  directly above and below each other. These pairs do not depend on where the
+  rows are cut, which is what lets the width be settled first;
+- the **phase**, where the row boundaries fall, from the consecutive pairs: at a
+  boundary, consecutive numbers sit at opposite ends of the grid rather than
+  side by side. It is a separate question because a montage whose first contact
+  was unplaceable starts counting at the second, putting every boundary one
+  column out.
+
+-- and gets the exact 112-edge lattice on that crumpled grid, on 4x16 as
+readily as 8x8, and with any single contact removed.
+
+The fallback, for a montage with an explicit group column and names that carry
+no contact number, is the **relative neighbourhood graph**: join two contacts
+when no third is closer to both than they are to each other. It is a comparison
+between distances rather than a threshold on them, so it carries no notion of
+scale and holds up under moderate drape, but it degrades on a badly crumpled
+grid in the way any purely geometric answer must.
+
+An explicit rows-by-columns field on `ElectrodeSet` would retire the width
+search, and remains the obvious upgrade if a montage ever turns up that the
+recovery gets wrong. It is not needed to draw the montages we have.
+
+## 7. Still to settle
 
 - **quickflat's depth argument.** `make_figure` already takes `depth` for
   volumetric sampling. `add_electrodes` needs its own depth selection, and
