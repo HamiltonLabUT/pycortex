@@ -164,6 +164,12 @@ def test_non_finite_coordinates_do_not_poison_the_others(hemis):
         ("superiortemporal", ON_SURFACE),           # Desikan-Killiany
         ("ctx_lh_G_temporal_inf", ON_SURFACE),      # Destrieux
         ("ctx_lh_S_circular_insula_sup", ON_SURFACE),
+        ("insula", ON_SURFACE),
+        # Near-misses. Parahippocampal gyrus is cortex; the pattern that must
+        # catch "Left-Hippocampus" is one character away from swallowing it, so
+        # it is "hippocampus" and not "hippocamp". Do not broaden it.
+        ("parahippocampal", ON_SURFACE),
+        ("ctx_lh_G_oc-temp_med-Parahip", ON_SURFACE),
         ("Left-Hippocampus", NON_CORTICAL),
         ("Left-Putamen", NON_CORTICAL),
         ("Left-VentralDC", NON_CORTICAL),
