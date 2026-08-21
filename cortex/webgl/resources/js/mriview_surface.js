@@ -104,7 +104,7 @@ var mriview = (function(module) {
             changeInflation: {action: this.changeInflation.bind(this), wheel: true, modKeys: ['shiftKey'], hidden: true, help:'Change inflation'},
             colorbar: {action:[this, "toggleColorbar"]},
             opacity: {action:[this.uniforms.dataAlpha, "value", 0, 1]},
-            transparency: {action:[this, "setSurfaceAlpha", 1, 0]},
+            surface_opacity: {action:[this, "setSurfaceAlpha", 0, 1]},
             ghostiness: {action:[this, "setFresnelPower", 0.5, 6]},
             toggleOpacity: {action: this.toggleOpacity.bind(this), key: 'o', hidden: true, help:'Toggle data opacity'},
             left: {action:[this, "setLeftVis"]},
@@ -427,8 +427,11 @@ var mriview = (function(module) {
     // enough that the disorder reads as depth rather than as noise.
     module.Surface.prototype._applySurfaceAlpha = function(shader) {
         var alpha = this.uniforms.surfaceAlpha.value;
-        shader.transparent = alpha < 1;
-        shader.depthWrite = alpha >= 1;
+        var transparent = alpha < 1;
+        if (shader.transparent === transparent)
+            return;                     // nothing to recompile
+        shader.transparent = transparent;
+        shader.depthWrite = !transparent;
         shader.needsUpdate = true;
     };
 
