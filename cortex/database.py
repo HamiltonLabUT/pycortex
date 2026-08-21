@@ -459,6 +459,88 @@ class Database:
             os.path.splitext(f)[0] for f in os.listdir(directory) if f.endswith(".json")
         )
 
+    # -- montages ---------------------------------------------------------
+    #
+    # A *montage* is one subject's electrodes as localised in some subject's
+    # anatomy: "native" is the patient's own scan, and any other name is a
+    # template the lab registered them to. The distinction the three methods
+    # below exist to keep straight is that the file is filed under the subject
+    # whose head the electrodes are in, while the coordinates belong to the
+    # surfaces of a possibly different subject:
+    #
+    #     <filestore>/S1/electrodes/electrodes_native.json     -> S1's surfaces
+    #     <filestore>/S1/electrodes/electrodes_fsaverage.json  -> fsaverage's
+    #
+    # They are a naming convention over `get_electrodes`/`save_electrodes`
+    # rather than a second storage mechanism, so a set saved under a plain name
+    # is still readable exactly as before.
+
+    def _montage_name(self, montage: str) -> str:
+        return "electrodes_%s" % montage
+
+    def surface_subject(self, subject: str, montage: str="native") -> str:
+        """Whose surfaces a montage's coordinates live in.
+
+        The whole rule, in one place because several callers need it and
+        disagreeing about it would put electrodes on the wrong brain.
+        """
+        return subject if montage == "native" else montage
+
+    def get_montage(self, subject: str, montage: str="native") -> "ElectrodeSet":
+        """One subject's electrodes as localised in ``montage``'s space.
+
+        Parameters
+        ----------
+        subject : str
+            Whose electrodes these are -- the subject the file is filed under.
+        montage : str
+            ``"native"`` for the subject's own scan, or the name of the subject
+            whose anatomy they were registered to (``"fsaverage"``,
+            ``"cvs_avg35_inMNI152"``).
+
+        Returns
+        -------
+        ElectrodeSet
+            With ``subject`` set to the *surface* subject and ``owner`` to
+            ``subject``. That assignment is the point of this method:
+            :meth:`~cortex.electrodes.ElectrodeSet.anchor` loads surfaces by
+            ``eset.subject``, so returning a template montage still labelled
+            with the implanted subject would anchor fsaverage coordinates
+            against that patient's cortex, silently and plausibly.
+        """
+        name = self._montage_name(montage)
+        fname = self.get_paths(subject)['electrodes'].format(name=name)
+        if not os.path.exists(fname):
+            raise IOError(
+                "No %r montage for subject %s. Available: %s"
+                % (montage, subject, ", ".join(self.list_montages(subject)) or "none")
+            )
+        eset = self.get_electrodes(subject, name=name)
+        eset.owner = np.array([subject] * len(eset), dtype=str)
+        eset.subject = self.surface_subject(subject, montage)
+        return eset
+
+    def save_montage(self, subject: str, eset: "ElectrodeSet", montage: str="native",
+                     overwrite: bool=False) -> str:
+        """Write an electrode set as one of a subject's montages."""
+        return self.save_electrodes(
+            subject, eset, name=self._montage_name(montage), overwrite=overwrite
+        )
+
+    def list_montages(self, subject: str) -> list[str]:
+        """The montages this subject has, possibly none.
+
+        Only sets following the ``electrodes_<montage>`` convention; a set saved
+        under some other name is still reachable through
+        :meth:`get_electrodes` but is not a montage.
+        """
+        prefix = self._montage_name("")
+        return [
+            name[len(prefix):]
+            for name in self.list_electrodes(subject)
+            if name.startswith(prefix) and len(name) > len(prefix)
+        ]
+
     def save_xfm(self, subject: str, name: str, xfm: npt.NDArray[np.floating], xfmtype: str="magnet", reference: Optional[str]=None):
         """
         Load a transform into the surface database. If the transform exists already, update it

@@ -80,6 +80,9 @@ class ElectrodeInfo(NamedTuple):
     hemi: str = MISSING
     depth: float = float("nan")
     placement: str = MISSING
+    #: Which subject this contact was implanted in. Only interesting once a set
+    #: holds more than one, which is what a tooltip over a combined montage needs.
+    owner: str = MISSING
 
 
 def _str_array(
@@ -135,6 +138,14 @@ class ElectrodeSet:
         hemisphere an electrode is in is decided by which surface it is
         nearer to, and a stated value neither overrides that nor is
         overridden by it in silence.
+    owner : sequence of str, optional
+        Which subject each contact was implanted in. Distinct from
+        :attr:`subject`, which says whose *surfaces* these coordinates live in
+        and therefore what they anchor to: a set read from S1's
+        ``electrodes_fsaverage.json`` has owner ``"S1"`` and subject
+        ``"fsaverage"``. The two differ only for a template montage, and a set
+        holding several owners only arises from
+        :meth:`cortex.Electrode.concat`.
 
     Notes
     -----
@@ -159,6 +170,7 @@ class ElectrodeSet:
         status: Optional[Sequence[str]] = None,
         group_type: Optional[Sequence[str]] = None,
         stated_hemisphere: Optional[Sequence[str]] = None,
+        owner: Optional[Sequence[str]] = None,
         anchors: Optional[ElectrodeAnchors] = None,
     ) -> None:
         self.names = np.array([str(n) for n in names], dtype=str)
@@ -193,6 +205,13 @@ class ElectrodeSet:
         self.anatomy = _str_array(anatomy, n, "anatomy")
         self.status = _str_array(status, n, "status")
         self.group_type = _str_array(group_type, n, "group_type")
+        # Defaults to `subject` rather than MISSING, because for a native
+        # montage -- which is every set P0 and P1 built -- the two really are
+        # the same subject, and defaulting to blank would make `select(owner=)`
+        # answer "none of them" for the common case.
+        self.owner = _str_array(
+            [subject or MISSING] * n if owner is None else owner, n, "owner"
+        )
         self.stated_hemisphere = (
             None
             if stated_hemisphere is None
@@ -248,6 +267,7 @@ class ElectrodeSet:
                 hemi=MISSING if self.anchors is None else str(self.anchors.hemi[i]),
                 depth=float("nan") if self.anchors is None else float(self.anchors.depth[i]),
                 placement=MISSING if self.anchors is None else str(self.anchors.placement[i]),
+                owner=str(self.owner[i]),
             )
 
         idx: Any = index
@@ -267,8 +287,43 @@ class ElectrodeSet:
             stated_hemisphere=(
                 None if self.stated_hemisphere is None else self.stated_hemisphere[idx]
             ),
+            owner=self.owner[idx],
             anchors=None if self.anchors is None else self.anchors[idx],
         )
+
+    def __eq__(self, other: Any) -> bool:
+        """Whether two sets describe the same electrodes in the same space.
+
+        Content equality, not identity, because two loads of one file must
+        compare equal: :func:`~cortex.dataset.views._resolve_channels` validates
+        a composite view's space by testing ``existing != value`` on whatever
+        identifies it, and an identity comparison there would reject a perfectly
+        good pair of channels.
+
+        Deliberately a **plain bool** rather than an elementwise array. That same
+        comparison is used in an ``if``, and a numpy array there raises "truth
+        value of an array is ambiguous".
+
+        Metadata is not compared: names, coordinates and the space they are in
+        are what make two sets the same set. Anatomy labels and statuses are
+        annotations on it, and a set that has since been anchored or relabelled
+        is still the same electrodes.
+        """
+        if not isinstance(other, ElectrodeSet):
+            return NotImplemented
+        return bool(
+            self.subject == other.subject
+            and np.array_equal(self.names, other.names)
+            and np.array_equal(self.coords, other.coords, equal_nan=True)
+        )
+
+    # Kept identity-based on purpose, rather than dropped or made to match
+    # __eq__. A set is mutable -- `db.get_electrodes` reassigns `subject` and
+    # `anchor()` reassigns `anchors` -- so a content hash would change under a
+    # dict; and defining __eq__ without this would make the class unhashable,
+    # which is a silent break for anything outside this repo that puts one in a
+    # set. Nothing here hashes an ElectrodeSet.
+    __hash__ = object.__hash__
 
     def __iter__(self) -> Iterator[ElectrodeInfo]:
         for i in range(len(self)):

@@ -175,6 +175,11 @@ def to_dict(eset: ElectrodeSet) -> dict[str, Any]:
     }
     if eset.stated_hemisphere is not None:
         out["stated_hemisphere"] = [str(h) for h in eset.stated_hemisphere]
+    # Written only when it says something `subject` does not, which keeps files
+    # for the ordinary single-subject native montage byte-identical to what
+    # earlier pycortex wrote.
+    if set(str(o) for o in eset.owner) != {eset.subject or ""}:
+        out["owner"] = [str(o) for o in eset.owner]
     if eset.anchors is not None:
         anchors = eset.anchors
         out["anchors"] = {
@@ -217,6 +222,10 @@ def from_dict(payload: dict[str, Any]) -> ElectrodeSet:
         status=payload.get("status"),
         group_type=payload.get("group_type"),
         stated_hemisphere=payload.get("stated_hemisphere"),
+        # Absent in every file written before montages existed, where it means
+        # "the subject this set is filed under" -- which is what the constructor
+        # defaults to.
+        owner=payload.get("owner"),
         anchors=anchors,
     )
 
