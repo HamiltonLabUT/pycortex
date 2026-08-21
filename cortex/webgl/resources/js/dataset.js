@@ -222,12 +222,31 @@ var dataset = (function(module) {
         }
     }
     THREE.EventDispatcher.prototype.apply(module.DataView.prototype);
+    // module.DataView.prototype.setVminmax = function(min, max, dim, idx) {
+    //     if (dim === undefined)
+    //         dim = 0;
+
+    //     if (idx === undefined) {
+    //         for (var i = 0; i < this.data.length; i++) {
+    //             this.vmin[i].value[dim] = min;
+    //             this.vmax[i].value[dim] = max;
+    //         }
+    //     } else {
+    //         this.vmin[idx].value[dim] = min;
+    //         this.vmax[idx].value[dim] = max;
+    //     }
+    // }
     module.DataView.prototype.setVminmax = function(min, max, dim, idx) {
         if (dim === undefined)
             dim = 0;
 
         if (idx === undefined) {
-            for (var i = 0; i < this.data.length; i++) {
+            // Over the bounds, not over the data. A 2D view has two data
+            // channels but still one pair of bounds -- `value` is [dim1, dim2],
+            // which is what `dim` indexes -- so looping to data.length reached a
+            // this.vmin[1] that does not exist and threw on every drag of a 2D
+            // view's slider, before any redraw could happen.
+            for (var i = 0; i < this.vmin.length; i++) {
                 this.vmin[i].value[dim] = min;
                 this.vmax[i].value[dim] = max;
             }
@@ -243,10 +262,32 @@ var dataset = (function(module) {
 
     // The per-contact values for one frame, or null if this view has none.
     // Read by electrodes.js, which colours its markers with them.
-    module.DataView.prototype.electrodeValues = function(frame) {
+    // module.DataView.prototype.electrodeValues = function(frame) {
+    //     if (!this.electrode)
+    //         return null;
+    //     var values = this.data[0].values;
+    //     if (!values.length)
+    //         return null;
+    //     if (frame === undefined)
+    //         frame = this.frame;
+    //     return values[Math.floor(frame).mod(values.length)];
+    // }
+        // The per-contact values of one channel for one frame, or null if this view
+    // has none. Read by electrodes.js, which colours its markers with them.
+    //
+    // `dim` selects the channel, and a 2D view really does have two: it is two
+    // arrays over the same montage read against a 2D colormap, exactly as the
+    // shader reads `data0` and `data2`. Serving only dim 0 is what left every
+    // marker on the bottom row of that colormap -- one axis of the map, and so
+    // one half of the data, invisible.
+    module.DataView.prototype.electrodeValues = function(frame, dim) {
         if (!this.electrode)
             return null;
-        var values = this.data[0].values;
+        if (dim === undefined)
+            dim = 0;
+        if (dim >= this.data.length)
+            return null;
+        var values = this.data[dim].values;
         if (!values.length)
             return null;
         if (frame === undefined)

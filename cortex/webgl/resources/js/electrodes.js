@@ -268,10 +268,53 @@ var electrodes = (function(module) {
 
     // Recolour every contact from the bound dataview's current frame. Cheap
     // enough to call on any change rather than working out which changed.
+    // module.Electrodes.prototype.setValues = function() {
+    //     var view = this.dataview;
+    //     var values = view === null ? null : view.electrodeValues();
+    //     var pixels = view === null ? null : _cmapPixels(view.cmap[0].value);
+
+    //     if (values === null || pixels === null) {
+    //         for (var i = 0; i < this.contacts.length; i++)
+    //             this.contacts[i].mesh.material.color.copy(this.material.color);
+    //         this.surf.dispatchEvent({type:"update"});
+    //         return;
+    //     }
+
+    //     var vmin = view.vmin[0].value[0], vmax = view.vmax[0].value[0];
+    //     var span = vmax - vmin;
+    //     // A 1-D colormap is one row; a 2-D one is a square, and a scalar view
+    //     // read against it should walk its diagonal-free bottom row, which is
+    //     // what the shader does for a single channel.
+    //     var row = (pixels.height - 1) * pixels.width * 4;
+    //     var last = pixels.width - 1;
+
+    //     for (var i = 0; i < this.contacts.length; i++) {
+    //         var mat = this.contacts[i].mesh.material;
+    //         var v = i < values.length ? values[i] : NaN;
+    //         if (isNaN(v)) {
+    //             // No value for this contact -- a NaN in the data, or a montage
+    //             // longer than the array. Grey says "not measured" rather than
+    //             // borrowing whatever colour zero happens to have.
+    //             mat.color.setRGB(0.5, 0.5, 0.5);
+    //             continue;
+    //         }
+    //         var frac = span === 0 ? 0.5 : (v - vmin) / span;
+    //         frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
+    //         var o = row + Math.round(frac * last) * 4;
+    //         mat.color.setRGB(
+    //             pixels.data[o] / 255, pixels.data[o + 1] / 255, pixels.data[o + 2] / 255
+    //         );
+    //     }
+    //     this.surf.dispatchEvent({type:"update"});
+    // };
     module.Electrodes.prototype.setValues = function() {
         var view = this.dataview;
-        var values = view === null ? null : view.electrodeValues();
+        var values = view === null ? null : view.electrodeValues(undefined, 0);
         var pixels = view === null ? null : _cmapPixels(view.cmap[0].value);
+        // The second channel, for a 2D view. Null for a scalar one, and then
+        // the colormap is read along a single row exactly as the shader reads
+        // it with `vec2(x, 0.)`.
+        var values2 = view === null ? null : view.electrodeValues(undefined, 1);
 
         if (values === null || pixels === null) {
             for (var i = 0; i < this.contacts.length; i++)
@@ -282,25 +325,40 @@ var electrodes = (function(module) {
 
         var vmin = view.vmin[0].value[0], vmax = view.vmax[0].value[0];
         var span = vmax - vmin;
-        // A 1-D colormap is one row; a 2-D one is a square, and a scalar view
-        // read against it should walk its diagonal-free bottom row, which is
-        // what the shader does for a single channel.
-        var row = (pixels.height - 1) * pixels.width * 4;
-        var last = pixels.width - 1;
+        // One pair of bounds per axis of the colormap, not per data array:
+        // `value` is [dim1, dim2] and the vertical slider writes its second
+        // entry, which is why both come off vmin[0].
+        var vmin2 = view.vmin[0].value[1], vmax2 = view.vmax[0].value[1];
+        var span2 = vmax2 - vmin2;
+        var lastx = pixels.width - 1, lasty = pixels.height - 1;
 
         for (var i = 0; i < this.contacts.length; i++) {
             var mat = this.contacts[i].mesh.material;
             var v = i < values.length ? values[i] : NaN;
-            if (isNaN(v)) {
-                // No value for this contact -- a NaN in the data, or a montage
-                // longer than the array. Grey says "not measured" rather than
-                // borrowing whatever colour zero happens to have.
+            var v2 = values2 === null ? 0
+                : (i < values2.length ? values2[i] : NaN);
+            if (isNaN(v) || isNaN(v2)) {
+                // No value for this contact -- a NaN in either channel, or a
+                // montage longer than the array. Grey says "not measured"
+                // rather than borrowing whatever colour zero happens to have,
+                // and matches the alpha=0 the matplotlib path gives a NaN in
+                // either dimension.
                 mat.color.setRGB(0.5, 0.5, 0.5);
                 continue;
             }
             var frac = span === 0 ? 0.5 : (v - vmin) / span;
             frac = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
-            var o = row + Math.round(frac * last) * 4;
+            var frac2 = values2 === null ? 0
+                : (span2 === 0 ? 0.5 : (v2 - vmin2) / span2);
+            frac2 = frac2 < 0 ? 0 : (frac2 > 1 ? 1 : frac2);
+            // `frac2` is a texture coordinate, which runs up the image, while
+            // the rows of pixel data run down it -- the colormaps are uploaded
+            // with flipY set (mriview.js), so the top row is the *high* end of
+            // the second axis. Hence `1 - frac2`, which is the same flip
+            // `Dataview2D._to_raw` applies for the matplotlib path. A scalar
+            // view has frac2 = 0 and so lands on the bottom row.
+            var row = Math.round((1 - frac2) * lasty) * pixels.width;
+            var o = (row + Math.round(frac * lastx)) * 4;
             mat.color.setRGB(
                 pixels.data[o] / 255, pixels.data[o + 1] / 255, pixels.data[o + 2] / 255
             );
