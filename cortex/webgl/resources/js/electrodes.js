@@ -153,6 +153,25 @@ var electrodes = (function(module) {
                 // Anatomical surface: every contact is at its measured position,
                 // so there is no "sampled depth" to be near or far from.
                 contact.mesh.visible = this._visible && this._passesFilters(contact);
+
+                // ...but still stand it off along the local normal. A measured
+                // coordinate is the truth and `lift` at 0 draws exactly that,
+                // which is what a depth electrode needs. It is the wrong default
+                // for a subdural contact: those are recorded at or just inside
+                // the pial surface, an opaque cortex swallows them whole, and
+                // the result is markers that are present, hoverable and
+                // labelled while being completely invisible. Lift applied only
+                // in the morphed branch made this control silently do nothing
+                // in the view it is needed in most.
+                if (this.lift !== 0) {
+                    var at0 = mriview.get_position_bary(
+                        this.posdata[contact.hemi], 0, evt.thickmix,
+                        contact.verts, contact.weights
+                    );
+                    this._raw.add(
+                        at0.norm.normalize().multiplyScalar(this.radius * this.lift)
+                    );
+                }
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
