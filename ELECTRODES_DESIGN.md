@@ -341,7 +341,48 @@ Each phase is independently verifiable and independently useful.
    scrubbing recolour electrodes exactly as they recolour `Vertex` data. This is
    the one place electrodes touch shader code, and it lands in P3.
 
-## 4. Still to settle
+## 4. What a real montage changed
+
+Reading one real clinical montage -- an `img_pipe`-style `TDT_elecs_all.mat`,
+366 rows -- broke three things and improved a fourth. Recorded here because
+none of them were guessable from the data specification.
+
+**Placeholder rows exist, and they are not electrodes.** Thirty-six rows carried
+non-finite coordinates, names `NaN1`-`NaN32`, device type `NaN` and blank
+anatomy: unconnected amplifier channels. A NaN reaching `cKDTree.query`
+corrupts the whole result rather than failing, so non-finite rows are now held
+back from the search and marked `no_coordinate`.
+
+**Those names collide.** `NaN1`-`NaN4` each appeared twice, because a second
+disconnected block restarted the numbering. `ElectrodeSet` requires unique names
+-- everything downstream identifies a contact by name -- so the reader drops
+coordinate-less rows by default, which removes every duplicate along with them.
+Keeping them (`drop_missing=False`, for when row indices must line up with a
+data array over all original channels) still refuses such a file, which is
+documented rather than fixed.
+
+**Key on the coordinate, not the name.** In that file the name test and the
+coordinate test selected exactly the same 36 rows. `NaN1` is one lab's spelling
+of "no electrode here"; a non-finite coordinate is everyone's.
+
+**The anatomy column is the one thing geometry cannot replace.** A single column
+carried four vocabularies at once -- Desikan-Killiany parcels
+(`superiortemporal`), Destrieux parcels (`ctx_lh_G_temporal_inf`), FreeSurfer
+aseg structures (`Left-Hippocampus`, `Left-Putamen`, `Left-Cerebral-White-Matter`)
+-- plus the literal `Unknown` and blanks. The aseg entries answer the question
+raised in 2.3 and visible in the P0 preview: which contacts have no cortex to be
+on. Geometry cannot tell, because a contact in white matter still has cortex a
+millimetre away on some sulcal bank; the label can. Hence a fifth placement
+outcome, `non_cortical`, on by default. It marks rather than excludes -- where a
+hippocampal contact projects to is usually exactly what a reader wants shown --
+and it is a far better reading of the design document's "if anatomy is Unknown,
+drop" than a literal one, which would have caught three contacts in that montage
+and missed the eleven labelled as white matter or subcortical.
+
+Labels are stored verbatim. Normalising the vocabularies would discard the
+distinction that makes them useful.
+
+## 5. Still to settle
 
 - **quickflat's depth argument.** `make_figure` already takes `depth` for
   volumetric sampling. `add_electrodes` needs its own depth selection, and

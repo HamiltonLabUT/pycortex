@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Mapping, NamedTuple, Optional, Sequence, Union
+from typing import Any, Mapping, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -61,7 +61,27 @@ TOO_FAR = "too_far"
 UNKNOWN_ANATOMY = "unknown_anatomy"
 """Excluded by the anatomy rule rather than by geometry."""
 
-PLACEMENTS = (ON_SURFACE, PROJECTED, TOO_FAR, UNKNOWN_ANATOMY)
+NON_CORTICAL = "non_cortical"
+"""Labelled as white matter or a subcortical structure.
+
+Not a geometric outcome -- the anchor is perfectly good -- but a statement that
+the *label* says there is no cortex here to be on. Real montages carry these in
+quantity: a depth electrode's contacts are routinely labelled
+``Left-Cerebral-White-Matter``, ``Left-Hippocampus`` or ``Left-Putamen``, and
+the surface position such a contact projects to is a rough locality rather than
+a location. The geometry cannot tell -- a contact in white matter still has
+cortex a millimetre away on some sulcal bank -- so this is the one thing only
+the anatomy column knows."""
+
+NO_COORDINATE = "no_coordinate"
+"""No usable coordinate: the row had a non-finite x, y or z.
+
+Montages carry placeholder rows for unconnected amplifier channels, with NaN
+coordinates and names like ``NaN1``. They are kept rather than dropped so the
+row indices still line up with a data array recorded on the same channels."""
+
+PLACEMENTS = (ON_SURFACE, PROJECTED, TOO_FAR, UNKNOWN_ANATOMY,
+              NON_CORTICAL, NO_COORDINATE)
 
 
 class SurfacePair(NamedTuple):
@@ -109,6 +129,20 @@ class PlacementPolicy:
         Apply the anatomy rule at all. Off by default.
     unknown_labels : sequence of str
         Anatomical labels counted as unknown, compared case-insensitively.
+    flag_non_cortical : bool
+        Mark electrodes whose anatomical label names white matter or a
+        subcortical structure as :data:`NON_CORTICAL`. On by default, because
+        the alternative is drawing them as though they were on cortex. They are
+        still *placed*: marking is not dropping, and ``select(placeable=True)``
+        keeps them, since where a hippocampal contact projects to is often
+        exactly what a reader wants to see.
+    non_cortical_patterns : sequence of str
+        Substrings that make a label non-cortical, matched case-insensitively.
+        The defaults cover FreeSurfer's aseg vocabulary -- ``Left-Hippocampus``,
+        ``Left-Cerebral-White-Matter`` and the rest -- which is what appears in
+        an anatomy column alongside cortical parcel names. Destrieux and
+        Desikan-Killiany cortical labels (``superiortemporal``,
+        ``ctx_lh_G_temporal_inf``) deliberately do not match.
     """
 
     max_offset_mm: float = 10.0
@@ -116,6 +150,14 @@ class PlacementPolicy:
     max_below_wm_mm: Optional[float] = None
     drop_unknown_anatomy: bool = False
     unknown_labels: Sequence[str] = ("", "unknown", "none", "n/a", "nan")
+    flag_non_cortical: bool = True
+    non_cortical_patterns: Sequence[str] = (
+        "white-matter", "white_matter", "wm",
+        "left-", "right-",          # FreeSurfer aseg subcortical labels
+        "hippocampus", "amygdala", "putamen", "thalamus", "caudate",
+        "pallidum", "accumbens", "ventricle", "ventraldc", "brain-stem",
+        "csf", "vessel", "choroid",
+    )
 
 
 @dataclass
@@ -192,8 +234,15 @@ class ElectrodeAnchors:
 
     @property
     def placeable(self) -> npt.NDArray[np.bool_]:
-        """Electrodes the policy accepted -- everything not excluded."""
-        return (self.placement == ON_SURFACE) | (self.placement == PROJECTED)
+        """Electrodes that have an honest surface position.
+
+        :data:`NON_CORTICAL` counts as placeable: the anchor is sound, and where
+        a hippocampal or white-matter contact projects to is usually exactly
+        what a reader wants shown -- flagged, not hidden. Only
+        :data:`TOO_FAR`, :data:`UNKNOWN_ANATOMY` and :data:`NO_COORDINATE` are
+        excluded.
+        """
+        return np.isin(self.placement, [ON_SURFACE, PROJECTED, NON_CORTICAL])
 
     def evaluate(
         self, surfaces: Mapping[str, npt.NDArray[np.floating]]
@@ -476,35 +525,44 @@ def anchor_to_surfaces(
             raise ValueError("hemisphere must be one of %r, got %r" % (HEMIS, hemi))
     policy = policy or PlacementPolicy()
 
-    per_hemi = {h: _anchor_one_hemisphere(coords, hemis[h], neighbours) for h in hemis}
+    # Placeholder rows for unconnected amplifier channels carry NaN coordinates,
+    # and a NaN reaching cKDTree.query poisons the result rather than failing
+    # loudly. Anchor only the real ones and fill the rest in afterwards, keeping
+    # the rows, so indices still line up with data recorded on those channels.
+    finite = np.isfinite(coords).all(axis=1)
+    real = coords[finite]
 
-    # Whichever hemisphere's mid-surface the electrode is closer to.
+    per_hemi = {h: _anchor_one_hemisphere(real, hemis[h], neighbours) for h in hemis}
+
+    # Whichever hemisphere's cortical slab the electrode is closer to.
     names = sorted(per_hemi)
     stacked = np.stack([per_hemi[h]["distance"] for h in names], axis=1)
     winner = np.argmin(stacked, axis=1)
 
-    n = len(coords)
-    take = lambda key: np.stack(  # noqa: E731
+    m, n = len(real), len(coords)
+    pick = lambda key: np.stack(  # noqa: E731
         [per_hemi[h][key] for h in names], axis=1
-    )[np.arange(n), winner]
+    )[np.arange(m), winner]
 
-    hemi_of = np.array([names[w] for w in winner], dtype="<U2")
-    stack2d = lambda key: np.stack(  # noqa: E731
-        [per_hemi[h][key] for h in names], axis=1
-    )[np.arange(n), winner]
+    def scatter(values: npt.NDArray, fill: Any) -> npt.NDArray:
+        """Put per-real-electrode results back at their original row indices."""
+        out = np.full((n,) + values.shape[1:], fill, dtype=values.dtype)
+        out[finite] = values
+        return out
 
     anchors = ElectrodeAnchors(
-        hemi=hemi_of,
-        verts=stack2d("verts").astype(np.intp),
-        weights=stack2d("weights"),
-        depth=take("depth"),
-        depth_mm=take("depth_mm"),
-        thickness_mm=take("thickness_mm"),
-        offset_mm=take("offset_mm"),
+        hemi=scatter(np.array([names[w] for w in winner], dtype="<U2"), ""),
+        verts=scatter(pick("verts").astype(np.intp), 0),
+        weights=scatter(pick("weights"), np.nan),
+        depth=scatter(pick("depth"), np.nan),
+        depth_mm=scatter(pick("depth_mm"), np.nan),
+        thickness_mm=scatter(pick("thickness_mm"), np.nan),
+        offset_mm=scatter(pick("offset_mm"), np.nan),
         placement=np.full(n, ON_SURFACE, dtype="<U16"),
         surface_hash=surface_hash(hemis),
     )
     anchors.placement = classify_placement(anchors, policy, anatomy)
+    anchors.placement[~finite] = NO_COORDINATE
     return anchors
 
 
@@ -536,18 +594,29 @@ def classify_placement(
         too_far |= np.nan_to_num(below) > policy.max_below_wm_mm
     placement[too_far] = TOO_FAR
 
-    if policy.drop_unknown_anatomy:
+    if policy.drop_unknown_anatomy or policy.flag_non_cortical:
         if anatomy is None:
-            raise ValueError(
-                "policy.drop_unknown_anatomy is set but no anatomy labels were given"
-            )
-        labels = np.array([str(a).strip().lower() for a in anatomy])
-        unknown = np.isin(labels, [u.lower() for u in policy.unknown_labels])
-        if len(unknown) != n:
-            raise ValueError(
-                "anatomy has %d entries but there are %d electrodes" % (len(unknown), n)
-            )
-        placement[unknown & ~too_far] = UNKNOWN_ANATOMY
+            if policy.drop_unknown_anatomy:
+                raise ValueError(
+                    "policy.drop_unknown_anatomy is set but no anatomy labels "
+                    "were given"
+                )
+        else:
+            labels = np.array([str(a).strip().lower() for a in anatomy])
+            if len(labels) != n:
+                raise ValueError(
+                    "anatomy has %d entries but there are %d electrodes"
+                    % (len(labels), n)
+                )
+            if policy.flag_non_cortical:
+                patterns = [q.lower() for q in policy.non_cortical_patterns]
+                non_cortical = np.array(
+                    [any(q in label for q in patterns) for label in labels]
+                )
+                placement[non_cortical & ~too_far] = NON_CORTICAL
+            if policy.drop_unknown_anatomy:
+                unknown = np.isin(labels, [u.lower() for u in policy.unknown_labels])
+                placement[unknown & ~too_far] = UNKNOWN_ANATOMY
 
     return placement
 

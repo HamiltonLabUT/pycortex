@@ -9,6 +9,11 @@ Two formats, for two jobs.
 load without a bespoke parser, and files pycortex writes are readable by
 everything else in the iEEG ecosystem. Missing values are ``n/a``, per BIDS.
 
+**MATLAB ``*_elecs_all.mat``** is what ``img_pipe`` and the labs downstream of
+it write -- ``TDT_elecs_all.mat``, ``clinical_elecs_all.mat`` -- holding
+``elecmatrix`` (n by 3, surface RAS), ``eleclabels`` (short name, long name,
+device type) and usually ``anatomy`` (those three plus an anatomical label).
+
 **JSON** is the filestore format, at
 ``<filestore>/<subject>/electrodes/<name>.json``. It carries the same fields
 plus the derived anchors and the hash of the surfaces they were computed
@@ -26,6 +31,7 @@ import os
 from typing import Any, Iterable, Optional, Sequence, Union
 
 import numpy as np
+import numpy.typing as npt
 
 from ._anchor import ElectrodeAnchors
 from ._set import MISSING, ElectrodeSet
@@ -234,11 +240,14 @@ def load_electrodes(
     fname: Union[str, os.PathLike], subject: Optional[str] = None
 ) -> ElectrodeSet:
     """Read an electrode set, picking the reader by extension."""
-    if str(fname).lower().endswith(".json"):
+    lowered = str(fname).lower()
+    if lowered.endswith(".json"):
         eset = load_electrodes_json(fname)
         if subject is not None:
             eset.subject = subject
         return eset
+    if lowered.endswith(".mat"):
+        return read_elecs_mat(fname, subject=subject)
     return read_electrodes_tsv(fname, subject=subject)
 
 
@@ -267,3 +276,134 @@ def _nan_to_none(values: Iterable[float]) -> list[Optional[float]]:
 
 def _none_to_nan(values: Sequence[Optional[float]]) -> np.ndarray:
     return np.array([np.nan if v is None else v for v in values], dtype=np.float64)
+
+
+def read_elecs_mat(
+    fname: Union[str, os.PathLike],
+    subject: Optional[str] = None,
+    drop_missing: bool = True,
+) -> "ElectrodeSet":
+    """Read an ``img_pipe``-style ``*_elecs_all.mat``.
+
+    The format ``img_pipe`` writes and that several iEEG labs have standardised
+    on. Three arrays, of which only the first is required:
+
+    ``elecmatrix``
+        ``(n, 3)`` coordinates in FreeSurfer surface RAS -- the same space
+        pycortex holds its surfaces in, so no transform is needed.
+    ``eleclabels``
+        ``(n, 3)`` cell array: short channel name, long channel name, device
+        type (``grid``, ``strip``, ``depth``).
+    ``anatomy``
+        ``(n, 4)`` cell array: those three plus an anatomical label.
+
+    Parameters
+    ----------
+    fname : path
+    subject : str, optional
+        pycortex subject to attach the set to.
+    drop_missing : bool
+        Drop rows whose coordinates are not finite. On by default, because such
+        rows are placeholders for unconnected amplifier channels rather than
+        electrodes.
+
+        Turn it off to keep them, so row indices still line up with a data array
+        recorded on all the original channels; they then anchor to
+        :data:`~cortex.electrodes.NO_COORDINATE` and draw nowhere. Note the
+        catch: those rows are conventionally named ``NaN1``, ``NaN2`` and so on,
+        and a montage with two disconnected blocks restarts that numbering, so
+        the names collide and :class:`~cortex.electrodes.ElectrodeSet` refuses
+        the set. Uniqueness is worth keeping -- names are how everything
+        downstream identifies a contact -- so a file like that must be read with
+        ``drop_missing=True``, which is why it is the default.
+
+        Keying on the coordinate rather than on the name is deliberate: a
+        non-finite coordinate means "no electrode here" in any lab's
+        convention, where ``NaN1`` is one lab's spelling of it.
+
+    Returns
+    -------
+    ElectrodeSet
+
+    Notes
+    -----
+    The anatomy column mixes vocabularies, and that is not a defect to
+    normalise away: one real montage carries Desikan-Killiany parcels
+    (``superiortemporal``), Destrieux parcels (``ctx_lh_G_temporal_inf``),
+    FreeSurfer aseg structures (``Left-Hippocampus``,
+    ``Left-Cerebral-White-Matter``), the literal string ``Unknown``, and blanks,
+    all in the same file. They are stored verbatim;
+    :class:`~cortex.electrodes.PlacementPolicy` is what interprets them, and it
+    is the aseg entries that tell you which contacts have no cortex to be on.
+    """
+    import scipy.io
+
+    from ._set import ElectrodeSet
+
+    mat = scipy.io.loadmat(str(fname))
+    if "elecmatrix" not in mat:
+        raise ValueError(
+            "%s has no 'elecmatrix'; keys are %s"
+            % (fname, ", ".join(k for k in mat if not k.startswith("__")))
+        )
+
+    coords = np.asarray(mat["elecmatrix"], dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] < 3:
+        raise ValueError("elecmatrix must be (n, 3), got %r" % (coords.shape,))
+    coords = coords[:, :3]
+    n = len(coords)
+
+    table = _cell_to_str(mat.get("anatomy"))
+    if table is None or len(table) != n:
+        table = _cell_to_str(mat.get("eleclabels"))
+    if table is not None and len(table) != n:
+        table = None
+
+    def column(index: int) -> Optional[list[str]]:
+        if table is None or table.shape[1] <= index:
+            return None
+        return [_clean(v) for v in table[:, index]]
+
+    names = column(0) or ["e%d" % (i + 1) for i in range(n)]
+    group_type = column(2)
+    anatomy = column(3)
+
+    keep = np.asarray(
+        np.isfinite(coords).all(axis=1) if drop_missing else np.ones(n),
+        dtype=bool,
+    )
+
+    def subset(values: Optional[Sequence[str]]) -> Optional[list[str]]:
+        if values is None:
+            return None
+        return [v for v, k in zip(values, keep.tolist()) if k]
+
+    kept_names = subset(names)
+    assert kept_names is not None                    # `names` is never None
+    return ElectrodeSet(
+        names=kept_names,
+        coords=coords[keep],
+        subject=subject,
+        group_type=subset(group_type),
+        anatomy=subset(anatomy),
+    )
+
+
+def _cell_to_str(cell: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """A MATLAB cell array of char as a 2-D array of str.
+
+    ``loadmat`` hands back an object array whose entries are themselves ``(1, 1)``
+    arrays of ``numpy.str_``, with empty cells arriving as zero-size arrays.
+    """
+    if cell is None:
+        return None
+    cell = np.atleast_2d(np.asarray(cell, dtype=object))
+    out = np.empty(cell.shape, dtype=object)
+    for i in range(cell.shape[0]):
+        for j in range(cell.shape[1]):
+            value = cell[i, j]
+            if value is None or (hasattr(value, "size") and value.size == 0):
+                out[i, j] = MISSING
+            else:
+                out[i, j] = str(np.squeeze(value))
+    return out

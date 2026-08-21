@@ -32,6 +32,8 @@ Typical use::
 from __future__ import annotations
 
 from ._anchor import (
+    NON_CORTICAL,
+    NO_COORDINATE,
     ON_SURFACE,
     PLACEMENTS,
     PROJECTED,
@@ -51,6 +53,7 @@ from ._io import (
     from_dict,
     load_electrodes,
     load_electrodes_json,
+    read_elecs_mat,
     read_electrodes_tsv,
     save_electrodes_json,
     to_dict,
@@ -84,6 +87,8 @@ __all__ = [
     "surface_hash",
     "ON_SURFACE",
     "PROJECTED",
+    "NON_CORTICAL",
+    "NO_COORDINATE",
     "TOO_FAR",
     "UNKNOWN_ANATOMY",
     "PLACEMENTS",
@@ -94,6 +99,7 @@ __all__ = [
     # io
     "load_electrodes",
     "read_electrodes_tsv",
+    "read_elecs_mat",
     "write_electrodes_tsv",
     "load_electrodes_json",
     "save_electrodes_json",
