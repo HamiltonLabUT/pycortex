@@ -37,7 +37,144 @@ if TYPE_CHECKING:
     from ..electrodes import ElectrodeSet
 
 
-class Electrode(ScalarView, ElectrodeView):
+MARKER_SHAPES = ("sphere", "cube", "diamond")
+"""The shapes a marker may take.
+
+The single source of truth for the vocabulary, shared by the viewer's
+``module.makeGeometry`` and by ``quickflat``'s ``MARKER_BY_SHAPE``. Adding a
+shape means adding it in all three; the webgl tests walk this tuple and drive
+the viewer with each name, which is what stops them drifting apart.
+"""
+
+
+class _ElectrodeMarkers:
+    """Per-contact marker size and shape, carried on an electrode view.
+
+    Both are stored in ``attrs`` and exposed as properties, the way
+    :attr:`~cortex.dataset.views.Dataview.priority` is. That is not an
+    implementation shortcut: ``attrs`` is the one part of the view record
+    designed to be open, and it already round-trips through :meth:`copy`, HDF
+    slot 6, and :meth:`~cortex.dataset.views.Dataview.to_json` into the browser.
+    Storing them anywhere else would mean re-implementing all three.
+
+    They override what the montage says. An :class:`~cortex.electrodes.ElectrodeSet`
+    records each contact's physical diameter, which is the right default and is
+    the same for every dataset plotted on that montage; a view's vector is for
+    when the *data* should drive the marker -- bigger where the effect is
+    stronger, a different shape for the contacts under discussion. Absent
+    vectors leave the montage in charge.
+    """
+
+    #: Set by the concrete view classes; declared for mypy.
+    attrs: dict
+
+    @property
+    def n_electrodes(self) -> int:  # pragma: no cover - provided by the view
+        raise NotImplementedError
+
+    @property
+    def marker_size(self) -> Optional[npt.NDArray[np.floating]]:
+        """Per-contact marker diameter in millimetres, or None.
+
+        NaN at a position means "no override here" -- that contact falls back to
+        the montage's own diameter, matching
+        :attr:`~cortex.electrodes.ElectrodeSet.size`, where NaN likewise means
+        absent.
+        """
+        stored = self.attrs.get("marker_size")
+        if stored is None:
+            return None
+        return np.array([np.nan if v is None else v for v in stored], dtype=np.float64)
+
+    @property
+    def marker_shape(self) -> Optional[npt.NDArray[np.str_]]:
+        """Per-contact marker shape, one of :data:`MARKER_SHAPES`, or None."""
+        stored = self.attrs.get("marker_shape")
+        return None if stored is None else np.array(stored, dtype=str)
+
+    def _install_markers(
+        self,
+        marker_size: Optional[npt.ArrayLike],
+        marker_shape: Optional[Union[str, Sequence[str]]],
+    ) -> None:
+        """Validate and store, or leave whatever ``attrs`` already carried.
+
+        The precedence here is the inverse of ``priority``'s ``setdefault``, and
+        deliberately so: ``priority``'s default of 1 is indistinguishable from an
+        explicit 1, so metadata carried in ``attrs`` has to win. ``None`` here
+        means unambiguously "not given", which is what lets a view rebuilt from
+        HDF keep the vectors its ``attrs`` arrived with.
+        """
+        if marker_size is not None:
+            self.attrs["marker_size"] = self._check_size(marker_size)
+        elif "marker_size" in self.attrs:
+            self._recheck("marker_size", self._check_size)
+
+        if marker_shape is not None:
+            self.attrs["marker_shape"] = self._check_shape(marker_shape)
+        elif "marker_shape" in self.attrs:
+            self._recheck("marker_shape", self._check_shape)
+
+    def _recheck(self, key: str, check) -> None:
+        """Re-validate a key that arrived through ``attrs`` rather than a parameter.
+
+        Warns and drops rather than raising. ``Dataset.from_file`` swallows
+        per-view exceptions, so raising here would make the whole view disappear
+        instead of the one bad key -- which is a worse trade when the file is
+        someone else's and already written.
+        """
+        import warnings
+
+        try:
+            self.attrs[key] = check(self.attrs[key])
+        except (TypeError, ValueError) as exc:
+            warnings.warn("Dropping %s: %s" % (key, exc))
+            del self.attrs[key]
+
+    def _check_size(self, value: npt.ArrayLike) -> list:
+        n = self.n_electrodes
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim > 1:
+            raise ValueError(
+                "marker_size must be one value per contact, got shape %r. Markers "
+                "do not animate: a movie's frames all draw at the same size."
+                % (arr.shape,)
+            )
+        if arr.shape != (n,):
+            raise ValueError(
+                "marker_size has %d entries but the montage has %d contacts"
+                % (arr.size, n)
+            )
+        if np.any(arr[np.isfinite(arr)] < 0):
+            raise ValueError("marker_size must not be negative")
+        if np.isinf(arr).any():
+            raise ValueError("marker_size must be finite, or NaN to fall back")
+        # None rather than NaN: JSON has no NaN, and `_dumps` would emit a bare
+        # NaN token that survives being inlined into the page and then dies the
+        # moment anything calls JSON.parse.
+        return [None if np.isnan(v) else float(v) for v in arr]
+
+    def _check_shape(self, value: Union[str, Sequence[str]]) -> list:
+        n = self.n_electrodes
+        # Checked before any sequence handling, so a one-contact montage is not
+        # ambiguous between "a name" and "a sequence of one name".
+        names = [value] * n if isinstance(value, str) else [str(v) for v in value]
+        if len(names) != n:
+            raise ValueError(
+                "marker_shape has %d entries but the montage has %d contacts"
+                % (len(names), n)
+            )
+        unknown = sorted({name for name in names if name not in MARKER_SHAPES})
+        if unknown:
+            raise ValueError(
+                "unknown marker shape%s %s; expected one of %s"
+                % ("s" if len(unknown) > 1 else "", ", ".join(repr(u) for u in unknown),
+                   ", ".join(repr(s) for s in MARKER_SHAPES))
+            )
+        return names
+
+
+class Electrode(ScalarView, ElectrodeView, _ElectrodeMarkers):
     """One value per intracranial contact, with a colormap.
 
     The electrode counterpart of :class:`~cortex.dataset.views.Volume` and
@@ -113,6 +250,8 @@ class Electrode(ScalarView, ElectrodeView):
         attrs: Optional[Mapping[str, Any]] = None,
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
+        marker_size: Optional[npt.ArrayLike] = None,
+        marker_shape: Optional[Union[str, Sequence[str]]] = None,
     ) -> None:
         owner = subject if isinstance(subject, str) else subject.decode("utf-8")
         surface, montage = resolve_montage(owner, montage)
@@ -132,6 +271,10 @@ class Electrode(ScalarView, ElectrodeView):
             priority=priority,
             attrs=attrs,
         )
+
+        # After super(), because validation needs the space to know how many
+        # contacts the montage has.
+        self._install_markers(marker_size, marker_shape)
 
     _space: ElectrodeSpace
 
@@ -241,6 +384,13 @@ class Electrode(ScalarView, ElectrodeView):
             priority=self.priority,
             attrs=self.attrs,
             montage_subjects=self.montage_subjects if len(self.montage_subjects) > 1 else None,
+            # Passed explicitly rather than riding in `attrs`: `to_sub` reads a
+            # *different* montage, which may have a different number of contacts.
+            # The parameter path raises on a mismatch; the attrs path would warn
+            # and silently drop the vectors, and someone moving a montage onto a
+            # template wants to hear about it.
+            marker_size=self.marker_size,
+            marker_shape=self.marker_shape,
         )
 
     @classmethod
@@ -255,6 +405,8 @@ class Electrode(ScalarView, ElectrodeView):
         state: Any = None,
         priority: int = 1,
         attrs: Optional[Mapping[str, Any]] = None,
+        marker_size: Optional[npt.ArrayLike] = None,
+        marker_shape: Optional[Union[str, Sequence[str]]] = None,
     ) -> "Electrode":
         """Several subjects' electrodes on one common surface, as a single view.
 
@@ -341,6 +493,17 @@ class Electrode(ScalarView, ElectrodeView):
             group_type=[v for e in sets for v in e.group_type],
             owner=[v for e in sets for v in e.owner],
         )
+        # Markers concatenate from the contributors the way the montage's own
+        # `size` does above, unless the caller names them. All-or-nothing: a
+        # partial set would silently mean "and the rest get montage defaults",
+        # which is a quiet wrong answer of exactly the kind this feature exists
+        # to prevent.
+        views = [v for v in data.values() if isinstance(v, Electrode)]
+        if marker_size is None:
+            marker_size = _concat_markers(views, len(data), "marker_size")
+        if marker_shape is None:
+            marker_shape = _concat_markers(views, len(data), "marker_shape")
+
         return cls(
             np.concatenate(arrays, axis=-1),
             owners[0],
@@ -354,6 +517,8 @@ class Electrode(ScalarView, ElectrodeView):
             attrs=attrs,
             montage_subjects=owners,
             electrodes=combined,
+            marker_size=marker_size,
+            marker_shape=marker_shape,
         )
 
     # -- construction helpers -------------------------------------------
@@ -378,7 +543,7 @@ class Electrode(ScalarView, ElectrodeView):
         )
 
 
-class Electrode2D(Dataview2D[Electrode], ElectrodeView):
+class Electrode2D(Dataview2D[Electrode], ElectrodeView, _ElectrodeMarkers):
     """Two electrode channels over one montage, jointly colormapped.
 
     The case this exists for is comparing two models over the same contacts --
@@ -426,6 +591,8 @@ class Electrode2D(Dataview2D[Electrode], ElectrodeView):
         attrs: Optional[Mapping[str, Any]] = None,
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
+        marker_size: Optional[npt.ArrayLike] = None,
+        marker_shape: Optional[Union[str, Sequence[str]]] = None,
     ) -> None:
         surface, spec = _montage_spec(subject, montage, montage_subjects)
         chan1, chan2 = _resolve_2d_channels(
@@ -451,6 +618,10 @@ class Electrode2D(Dataview2D[Electrode], ElectrodeView):
             priority=priority,
             attrs=attrs,
         )
+
+        # After super(), because validation needs the space to know how many
+        # contacts the montage has.
+        self._install_markers(marker_size, marker_shape)
 
     @property
     def space(self) -> ElectrodeSpace:
@@ -490,6 +661,10 @@ class Electrode2D(Dataview2D[Electrode], ElectrodeView):
             alpha=self._alpha,
             state=self.state,
             priority=self.priority,
+            # Explicit for the same reason as Electrode.to_sub: a different
+            # montage may be a different length, and that should raise.
+            marker_size=self.marker_size,
+            marker_shape=self.marker_shape,
             attrs=self.attrs,
         )
 
@@ -499,7 +674,7 @@ class Electrode2D(Dataview2D[Electrode], ElectrodeView):
         )
 
 
-class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView):
+class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView, _ElectrodeMarkers):
     """Three electrode channels as red, green and blue, plus alpha.
 
     Parameters
@@ -554,6 +729,8 @@ class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView):
         attrs: Optional[Mapping[str, Any]] = None,
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
+        marker_size: Optional[npt.ArrayLike] = None,
+        marker_shape: Optional[Union[str, Sequence[str]]] = None,
     ) -> None:
         surface, spec = _montage_spec(subject, montage, montage_subjects)
         red, green, blue, resolved_alpha = _resolve_rgb_channels(
@@ -581,6 +758,10 @@ class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView):
             priority=priority,
             attrs=attrs,
         )
+
+        # After super(), because validation needs the space to know how many
+        # contacts the montage has.
+        self._install_markers(marker_size, marker_shape)
 
     @property
     def space(self) -> ElectrodeSpace:
@@ -620,11 +801,36 @@ class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView):
             description=self.description,
             state=self.state,
             priority=self.priority,
+            # Explicit for the same reason as Electrode.to_sub: a different
+            # montage may be a different length, and that should raise.
+            marker_size=self.marker_size,
+            marker_shape=self.marker_shape,
             attrs=self.attrs,
         )
 
     def __repr__(self) -> str:
         return "<RGB electrode data for (%s, %s)>" % (self.subject, self.montage)
+
+
+def _concat_markers(views: Sequence["Electrode"], n_inputs: int, attr: str):
+    """One marker vector from several contributing views, or None.
+
+    Returns None when nobody carries one, the concatenation when everybody does,
+    and raises in between -- a partial set would quietly mean "and the rest fall
+    back to their montages", which reads as a deliberate choice and is not one.
+    """
+    if len(views) != n_inputs:
+        return None                       # some inputs were plain arrays
+    carried = [getattr(v, attr) for v in views]
+    if all(c is None for c in carried):
+        return None
+    if any(c is None for c in carried):
+        missing = [v.montage_subjects[0] for v, c in zip(views, carried) if c is None]
+        raise ValueError(
+            "%s is set on some views but not on %s; set it on all of them or "
+            "none" % (attr, ", ".join(missing))
+        )
+    return np.concatenate(carried)
 
 
 def _shape_of(subject: str, montage: str) -> tuple[int, ...]:

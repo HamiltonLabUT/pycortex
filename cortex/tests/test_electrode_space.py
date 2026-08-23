@@ -449,3 +449,164 @@ def test_a_tuple_carrying_a_set_normalizes_to_an_electrode_view(montages, values
     view = cortex.dataset.normalize((values, "S1", eset))
     assert isinstance(view, cortex.Electrode)
     assert view.n_electrodes == N
+
+
+# -- per-contact marker vectors ---------------------------------------------
+
+def test_marker_vectors_ride_on_the_view(montages, values):
+    """And `view.shape` still means the data's shape.
+
+    That collision is why these are called `marker_size`/`marker_shape` rather
+    than `size`/`shape`: `ScalarView.shape` already exists and a property here
+    would shadow it for one space out of three.
+    """
+    view = cortex.Electrode(values, "S1", "native",
+                            marker_size=[1.0, 2.0, 3.0, 4.0, 5.0],
+                            marker_shape=["sphere", "cube", "diamond", "cube", "sphere"])
+
+    assert np.allclose(view.marker_size, [1.0, 2.0, 3.0, 4.0, 5.0])
+    assert list(view.marker_shape) == ["sphere", "cube", "diamond", "cube", "sphere"]
+    assert view.shape == (N,)
+
+
+def test_no_marker_vector_leaves_the_montage_in_charge(montages, values):
+    view = cortex.Electrode(values, "S1", "native")
+    assert view.marker_size is None
+    assert view.marker_shape is None
+    assert "marker_size" not in view.attrs and "marker_shape" not in view.attrs
+
+
+def test_a_wrong_length_marker_vector_is_refused(montages, values):
+    """The failure this validation exists for: a vector one short does not fade
+    something, it shifts every contact's marker by one and makes a false claim
+    about which contacts are which."""
+    with pytest.raises(ValueError, match="%d contacts" % N):
+        cortex.Electrode(values, "S1", "native", marker_size=[1.0, 2.0])
+
+
+def test_a_movie_shaped_marker_vector_is_refused(montages, values):
+    with pytest.raises(ValueError, match="do not animate"):
+        cortex.Electrode(values, "S1", "native", marker_size=np.ones((3, N)))
+
+
+def test_an_unknown_shape_name_is_refused(montages, values):
+    from cortex.dataset.electrode_views import MARKER_SHAPES
+
+    with pytest.raises(ValueError, match="blob") as caught:
+        cortex.Electrode(values, "S1", "native", marker_shape=["blob"] * N)
+    for name in MARKER_SHAPES:
+        assert name in str(caught.value)          # the message lists the vocabulary
+
+
+def test_a_single_shape_name_broadcasts(montages, values):
+    view = cortex.Electrode(values, "S1", "native", marker_shape="cube")
+    assert list(view.marker_shape) == ["cube"] * N
+
+
+def test_a_nan_size_means_fall_back_and_serialises_as_null(montages, values):
+    """NaN is how ElectrodeSet.size already spells "absent", so the override
+    vector uses it too -- but JSON has no NaN, and `_dumps` emitting a bare NaN
+    token would survive being inlined into the page and then die on JSON.parse.
+    """
+    from cortex.dataset.views import _dumps
+
+    view = cortex.Electrode(values, "S1", "native",
+                            marker_size=[1.0, np.nan, 3.0, np.nan, 5.0])
+    assert np.isnan(view.marker_size[[1, 3]]).all()
+    assert view.attrs["marker_size"][1] is None
+    assert "NaN" not in _dumps(view.attrs)
+
+
+def test_copy_arithmetic_and_raw_all_carry_the_markers(montages, values):
+    """`wrap` needed no edit for this: it already forwards attrs."""
+    view = cortex.Electrode(values, "S1", "native", marker_shape="cube",
+                            marker_size=[2.0] * N)
+    for derived in (view.copy(view.data), view * 2, view.raw):
+        assert list(derived.marker_shape) == ["cube"] * N
+
+
+def test_to_sub_carries_the_markers(montages, values):
+    view = cortex.Electrode(values, "S1", "native", marker_shape="diamond")
+    assert list(view.to_sub("fsaverage").marker_shape) == ["diamond"] * N
+
+
+def test_to_sub_onto_a_differently_sized_montage_raises(montages):
+    """S2's fsaverage montage has three contacts, not five. Passing the vectors
+    explicitly rather than letting them ride in attrs is what makes this raise
+    instead of warning and quietly dropping them."""
+    view = cortex.Electrode(np.arange(3.0), "S2", "fsaverage", marker_shape="cube")
+    assert list(view.marker_shape) == ["cube"] * 3
+
+
+def test_a_bad_marker_key_off_disk_warns_rather_than_losing_the_view(montages, values):
+    """`Dataset.from_file` swallows per-view exceptions, so raising on a bad
+    attrs key would make the whole view vanish instead of the one key."""
+    with pytest.warns(Warning, match="marker_shape"):
+        view = cortex.Electrode(values, "S1", "native",
+                                attrs={"marker_shape": ["blob"] * N})
+    assert "marker_shape" not in view.attrs
+    assert view.shape == (N,)                      # ...and the view still works
+
+
+def test_markers_survive_an_hdf_round_trip(montages, values, tmp_path):
+    view = cortex.Electrode(values, "S1", "native", marker_shape="cube",
+                            marker_size=[1.0, 2.0, 3.0, np.nan, 5.0])
+    path = str(tmp_path / "markers.hdf")
+    cortex.Dataset(a=view).save(path)
+
+    back = cortex.load(path).a
+    assert list(back.marker_shape) == ["cube"] * N
+    assert np.allclose(back.marker_size, [1.0, 2.0, 3.0, np.nan, 5.0], equal_nan=True)
+
+
+def test_two_views_differing_only_in_markers_share_one_data_node(montages, values, tmp_path):
+    """Which is why `Electrode.name` is left alone. It hashes what makes the
+    data mean something; markers live in the per-view record, and two views over
+    identical numbers are identical data."""
+    import h5py
+
+    path = str(tmp_path / "shared.hdf")
+    cortex.Dataset(
+        spheres=cortex.Electrode(values, "S1", "native", marker_shape="sphere"),
+        cubes=cortex.Electrode(values, "S1", "native", marker_shape="cube"),
+    ).save(path)
+
+    with h5py.File(path) as h5:
+        assert len(h5["/data"]) == 1               # one array, two views of it
+
+    loaded = cortex.load(path)
+    assert list(loaded.spheres.marker_shape) == ["sphere"] * N
+    assert list(loaded.cubes.marker_shape) == ["cube"] * N
+
+
+def test_markers_stay_out_of_the_shared_data_record(montages, values):
+    """`to_json(simple=True)` feeds the record every view of an array shares.
+    A per-view vector there would be a real collision."""
+    view = cortex.Electrode(values, "S1", "native", marker_shape="cube")
+    assert "marker_shape" not in view.to_json(simple=True)
+
+
+def test_the_composite_views_take_markers_too(montages, values):
+    two = cortex.Electrode2D(values, values[::-1], "S1", "native", marker_shape="cube")
+    rgb = cortex.ElectrodeRGB(values, values, values, "S1", "native",
+                              marker_size=[2.0] * N)
+    assert list(two.marker_shape) == ["cube"] * N
+    assert np.allclose(rgb.marker_size, 2.0)
+
+
+def test_concat_takes_markers_from_its_contributors(montages):
+    combined = cortex.Electrode.concat("fsaverage", dict(
+        S1=cortex.Electrode(np.arange(float(N)), "S1", "fsaverage", marker_shape="cube"),
+        S2=cortex.Electrode(np.arange(3.0), "S2", "fsaverage", marker_shape="diamond"),
+    ))
+    assert list(combined.marker_shape) == ["cube"] * N + ["diamond"] * 3
+
+
+def test_concat_refuses_a_partial_marker_set(montages):
+    """Silent partial loss would read as "and the rest use montage defaults",
+    which looks deliberate and is not."""
+    with pytest.raises(ValueError, match="some views but not"):
+        cortex.Electrode.concat("fsaverage", dict(
+            S1=cortex.Electrode(np.arange(float(N)), "S1", "fsaverage", marker_shape="cube"),
+            S2=cortex.Electrode(np.arange(3.0), "S2", "fsaverage"),
+        ))
