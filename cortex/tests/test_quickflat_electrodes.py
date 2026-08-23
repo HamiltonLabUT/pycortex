@@ -423,3 +423,81 @@ def test_a_png_of_electrode_data_is_written(view, tmp_path):
     cortex.quickflat.make_png(out, view, with_rois=False)
     import os
     assert os.path.getsize(out) > 1000
+
+
+# -- per-view marker vectors ------------------------------------------------
+
+@pytest.fixture
+def marked(eset):
+    """The same montage, wrapped in a view that overrides its markers."""
+    import cortex
+    n = len(eset)
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    return cortex.Electrode(
+        np.arange(float(n)), SUBJECT, "native",
+        marker_size=np.linspace(1.0, 5.0, n),
+        marker_shape=["cube"] * (n // 2) + ["diamond"] * (n - n // 2),
+    )
+
+
+def test_a_view_supplies_its_marker_shapes(flatfig, marked):
+    """Shapes come from the view rather than from group_type -- contrast with
+    test_group_type_picks_the_marker, which is the montage-only path."""
+    collections = add_electrodes(flatfig, marked)
+    assert set(collections) == {"s", "D"}          # cube, diamond
+
+
+def test_an_explicit_marker_still_beats_the_view(flatfig, marked):
+    collections = add_electrodes(flatfig, marked, marker="^")
+    assert set(collections) == {"^"}
+
+
+def test_a_view_supplies_its_marker_sizes(flatfig, marked):
+    collections = add_electrodes(flatfig, marked, marker="o", size_range=(10, 100))
+    sizes = collections["o"].get_sizes()
+    # Normalised onto size_range, so the ends land on it and the ramp is monotone.
+    assert np.isclose(sizes.min(), 10) and np.isclose(sizes.max(), 100)
+    assert np.all(np.diff(sizes) > 0)
+
+
+def test_size_by_still_beats_the_view(flatfig, marked):
+    """Explicit argument wins, the same rule the rest of add_electrodes follows.
+
+    The montage records two distinct diameters and the view's vector is a
+    monotone ramp, so which one was used is legible in the number of distinct
+    marker areas.
+    """
+    from_view = add_electrodes(flatfig, marked, marker="o")["o"].get_sizes()
+    from_field = add_electrodes(flatfig, marked, marker="o",
+                                size_by="size")["o"].get_sizes()
+
+    assert len(set(np.round(from_view, 6))) == len(from_view)      # the ramp
+    assert len(set(np.round(from_field, 6))) < len(from_field)     # the montage
+    assert not np.allclose(from_view, from_field)
+
+
+def test_view_markers_follow_filtering(flatfig, marked):
+    """The vectors are montage-length like the values, so they take the same
+    mask -- otherwise a filtered figure sizes the wrong contacts."""
+    drawn = add_electrodes(flatfig, marked, marker="o", depth=(-10.0, 10.0))
+    everything = add_electrodes(flatfig, marked, marker="o")
+    assert len(drawn["o"].get_offsets()) <= len(everything["o"].get_offsets())
+
+
+def test_a_view_without_markers_draws_what_it_always_did(flatfig, eset):
+    import cortex
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    plain = cortex.Electrode(np.arange(float(len(eset))), SUBJECT, "native")
+    collections = add_electrodes(flatfig, plain, size=40)
+    assert set(collections) == {MARKER_BY_GROUP_TYPE["grid"],
+                                MARKER_BY_GROUP_TYPE["seeg"]}
+    for coll in collections.values():
+        assert np.allclose(coll.get_sizes(), 40)
+
+
+def test_the_shape_table_covers_the_vocabulary():
+    """quickflat and the viewer must agree on what a shape name means."""
+    from cortex.dataset.electrode_views import MARKER_SHAPES
+    from cortex.quickflat.composite import MARKER_BY_SHAPE
+
+    assert set(MARKER_SHAPES) <= set(MARKER_BY_SHAPE)
