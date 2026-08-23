@@ -46,6 +46,8 @@ var electrodes = (function(module) {
         // drawn at the size the electrodes actually are.
         this.radius = json.radius === undefined ? 1.5 : json.radius;
         this.geometries = {};
+        this.subject = json.subject === undefined ? "" : json.subject;
+        this.nelec = json.nelec === undefined ? null : json.nelec;
         this._raw = new THREE.Vector3();   // scratch, reused every frame
         // How far, in millimetres, a contact may sit from the depth currently
         // being sampled and still be drawn on a deformed surface. Null shows
@@ -85,6 +87,8 @@ var electrodes = (function(module) {
             var verts = [
                 map[contact.verts[0]], map[contact.verts[1]], map[contact.verts[2]],
             ];
+            // What the montage says, kept so it can be restored when a view
+            // that overrode it is unbound.
             var shape = module.SHAPES[contact.group_type] || module.DEFAULT_SHAPE;
             // One material per contact rather than the shared one, so a contact
             // can take its own colour from data. They all start as copies of
@@ -109,6 +113,12 @@ var electrodes = (function(module) {
                 weights:    contact.weights,
                 shape:      shape,
                 radius:     radius,
+                baseShape:  shape,
+                baseRadius: radius,
+                // Position in the montage. Not the same as this contact's index
+                // in `contacts`, because the payload drops unplaceable ones --
+                // a view's arrays are montage-length and must be read by this.
+                index:      contact.index === undefined ? i : contact.index,
                 mesh:       mesh,
                 name:       contact.name,
                 group:      contact.group,
@@ -133,7 +143,7 @@ var electrodes = (function(module) {
             visible: {action:[this, "setVisible"]},
             labels:  {action:[this, "setLabels"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
-            shape: {action:[this, "setShape", ["sphere", "cube", "diamond"]]},
+            shape: {action:[this, "setShape", ["auto", "sphere", "cube", "diamond"]]},
         });
         if (this._filterFields.length)
             this.ui.addFolder("filter", true, this.filterUI);
@@ -284,7 +294,45 @@ var electrodes = (function(module) {
     // electrodes, so the markers go back to their flat colour.
     module.Electrodes.prototype.setDataView = function(dataview) {
         this.dataview = (dataview && dataview.electrode) ? dataview : null;
+        this._applyViewMarkers();
         this.setValues();
+    };
+
+    // Size and shape from the bound view, falling back to the montage.
+    //
+    // The montage records each contact's physical diameter, which is the right
+    // default and the same for every dataset drawn on it. A view's vectors are
+    // for when the data should drive the marker instead. Unbinding a view -- or
+    // binding one that carries nothing -- restores the montage, which is why
+    // every contact keeps its baseRadius and baseShape.
+    module.Electrodes.prototype._applyViewMarkers = function() {
+        var attrs = this.dataview ? (this.dataview.attrs || {}) : {};
+        var sizes = attrs.marker_size || null;
+        var shapes = attrs.marker_shape || null;
+
+        if (sizes !== null && this.nelec !== null && sizes.length !== this.nelec)
+            console.warn("marker_size has " + sizes.length + " entries but the "
+                       + "montage has " + this.nelec + " contacts");
+
+        for (var i = 0; i < this.contacts.length; i++) {
+            var c = this.contacts[i];
+            // By montage index, never by position: the payload drops
+            // unplaceable contacts, so the two disagree the moment any montage
+            // has one.
+            var size = sizes === null ? null : sizes[c.index];
+            var radius = (size === null || size === undefined) ? c.baseRadius : size / 2;
+            var shape = this._shapeOverride
+                || (shapes === null ? null : shapes[c.index])
+                || c.baseShape;
+
+            c.radius = radius;
+            c.shape = shape;
+            c.mesh.geometry = module.makeGeometry(this.geometries, shape, radius);
+            if (c.label !== undefined)
+                c.label.scale.set(radius * 4 * c.labelAspect, radius * 4, 1);
+        }
+        this._placeLabels();
+        this._refresh();
     };
 
     // Recolour every contact from the bound dataview's current frame. Cheap
@@ -373,6 +421,9 @@ var electrodes = (function(module) {
             // brain is measured in -- pycortex surfaces are millimetres, the
             // viewer this came from used metres.
             var label = module.makeLabelSprite(contact.name, contact.radius * 4);
+            // The sprite's texture is size-independent, so a later radius change
+            // only has to rescale it -- keep the aspect to do that with.
+            contact.labelAspect = label.scale.x / label.scale.y;
             label.visible = false;
             contact.label = label;
             this.labels.push(label);
@@ -608,20 +659,14 @@ var electrodes = (function(module) {
 
     // -- appearance ----------------------------------------------------------
 
+    // A global override on top of the bound view's shapes. "auto" clears it and
+    // hands control back -- without that the menu would win permanently after
+    // one click and a view's own shapes would be unrecoverable.
     module.Electrodes.prototype.setShape = function(val) {
         if (val === undefined)
-            return this._shape || module.DEFAULT_SHAPE;
-        this._shape = val;
-        for (var i = 0; i < this.contacts.length; i++) {
-            var c = this.contacts[i];
-            c.shape = val;
-            c.mesh.geometry = module.makeGeometry(this.geometries, val, c.radius);
-        }
-        // Swapping the geometry changes nothing on screen by itself: the viewer
-        // only paints when something asks it to, and a menu action is not a
-        // "mix" event. Without this the dropdown appears dead -- the meshes are
-        // cubes, the picture is still spheres.
-        this._refresh();
+            return this._shapeOverride || "auto";
+        this._shapeOverride = (val === "auto") ? null : val;
+        this._applyViewMarkers();
     };
 
     module.Electrodes.prototype.setLabels = function(val) {
@@ -672,6 +717,7 @@ var electrodes = (function(module) {
                 name: contact.name, group: contact.group,
                 group_type: contact.group_type, hemi: contact.hemi,
                 depth: contact.depth, shape: contact.shape,
+                radius: contact.radius, index: contact.index,
                 visible: contact.mesh.visible,
                 color: contact.mesh.material.color.getHex(),
                 verts: contact.verts, weights: contact.weights,

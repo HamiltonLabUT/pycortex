@@ -119,6 +119,12 @@ def to_viewer_json(
         if hemi not in HEMIS:
             continue
         contacts.append({
+            # Its position in the montage. The browser needs it because this
+            # function *drops* contacts -- unplaceable ones, and any whose
+            # hemisphere did not resolve -- while a view's per-contact arrays are
+            # montage-length. Without it the browser can only count, and counting
+            # is wrong the moment anything is dropped.
+            "index": int(i),
             "name": str(eset.names[i]),
             "group": str(eset.group[i]),
             "group_type": str(eset.group_type[i]).lower(),
@@ -145,6 +151,9 @@ def to_viewer_json(
 
     return {
         "electrodes": contacts,
+        # How long a montage-indexed array should be, so the browser can notice
+        # when it is handed one that does not match.
+        "nelec": int(len(eset)),
         "radius": float(radius),
         "color": color,
         "subject": eset.subject,
