@@ -95,7 +95,7 @@ class _ElectrodeMarkers:
     def _install_markers(
         self,
         marker_size: Optional[npt.ArrayLike],
-        marker_shape: Optional[Union[str, Sequence[str]]],
+        marker_shape: Optional[Union[str, Sequence[str], npt.NDArray]],
     ) -> None:
         """Validate and store, or leave whatever ``attrs`` already carried.
 
@@ -154,7 +154,7 @@ class _ElectrodeMarkers:
         # moment anything calls JSON.parse.
         return [None if np.isnan(v) else float(v) for v in arr]
 
-    def _check_shape(self, value: Union[str, Sequence[str]]) -> list:
+    def _check_shape(self, value: Union[str, Sequence[str], npt.NDArray]) -> list:
         n = self.n_electrodes
         # Checked before any sequence handling, so a one-contact montage is not
         # ambiguous between "a name" and "a sequence of one name".
@@ -251,7 +251,7 @@ class Electrode(ScalarView, ElectrodeView, _ElectrodeMarkers):
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
         marker_size: Optional[npt.ArrayLike] = None,
-        marker_shape: Optional[Union[str, Sequence[str]]] = None,
+        marker_shape: Optional[Union[str, Sequence[str], npt.NDArray]] = None,
     ) -> None:
         owner = subject if isinstance(subject, str) else subject.decode("utf-8")
         surface, montage = resolve_montage(owner, montage)
@@ -406,7 +406,7 @@ class Electrode(ScalarView, ElectrodeView, _ElectrodeMarkers):
         priority: int = 1,
         attrs: Optional[Mapping[str, Any]] = None,
         marker_size: Optional[npt.ArrayLike] = None,
-        marker_shape: Optional[Union[str, Sequence[str]]] = None,
+        marker_shape: Optional[Union[str, Sequence[str], npt.NDArray]] = None,
     ) -> "Electrode":
         """Several subjects' electrodes on one common surface, as a single view.
 
@@ -592,7 +592,7 @@ class Electrode2D(Dataview2D[Electrode], ElectrodeView, _ElectrodeMarkers):
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
         marker_size: Optional[npt.ArrayLike] = None,
-        marker_shape: Optional[Union[str, Sequence[str]]] = None,
+        marker_shape: Optional[Union[str, Sequence[str], npt.NDArray]] = None,
     ) -> None:
         surface, spec = _montage_spec(subject, montage, montage_subjects)
         chan1, chan2 = _resolve_2d_channels(
@@ -730,7 +730,7 @@ class ElectrodeRGB(DataviewRGB[Electrode], ElectrodeView, _ElectrodeMarkers):
         montage_subjects: Optional[Sequence[str]] = None,
         electrodes: Optional["ElectrodeSet"] = None,
         marker_size: Optional[npt.ArrayLike] = None,
-        marker_shape: Optional[Union[str, Sequence[str]]] = None,
+        marker_shape: Optional[Union[str, Sequence[str], npt.NDArray]] = None,
     ) -> None:
         surface, spec = _montage_spec(subject, montage, montage_subjects)
         red, green, blue, resolved_alpha = _resolve_rgb_channels(
