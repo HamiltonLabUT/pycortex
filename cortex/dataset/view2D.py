@@ -274,7 +274,9 @@ class Dataview2D(RenderableView, Generic[ScalarT]):
         return dict(
             state=self.state,
             description=self.description,
-            priority=self.priority,
+            # See ScalarView._build_raw: `attrs` carries `priority` and anything
+            # else stored beside it.
+            attrs=self.attrs,
         )
 
 
