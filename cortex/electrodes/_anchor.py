@@ -56,7 +56,10 @@ or a depth contact below the white matter. The anchor is meaningful; the
 electrode is not literally at the position drawn."""
 
 TOO_FAR = "too_far"
-"""Beyond the policy's tolerance -- no cortical column can honestly claim it."""
+"""Further from cortex than the policy allows -- no cortical column can
+honestly claim it. By default this means more than
+:attr:`PlacementPolicy.max_surface_distance_mm` from the nearest point on
+*either* bounding surface, pial or white matter."""
 
 UNKNOWN_ANATOMY = "unknown_anatomy"
 """Excluded by the anatomy rule rather than by geometry."""
@@ -102,6 +105,11 @@ class SurfacePair(NamedTuple):
 class PlacementPolicy:
     """Which electrodes are considered placeable, and how far is too far.
 
+    One number decides it by default: how far from cortex a contact may be and
+    still be worth drawing, as :attr:`max_surface_distance_mm`. The three
+    remaining geometric bounds are off unless set, and each asks a narrower
+    question than that one does.
+
     The rule is geometric first. The design document's original formulation --
     drop an electrode whose anatomical label is ``Unknown`` -- keys on a field
     that is *optional* in the data specification, so with unlabelled or
@@ -111,20 +119,47 @@ class PlacementPolicy:
 
     Parameters
     ----------
-    max_offset_mm : float
+    max_surface_distance_mm : float
+        How far an electrode may sit from the nearest point on a bounding
+        cortical surface -- pial *or* white matter, whichever is closer -- and
+        still be projected. This is the rule that says whether a projection
+        means anything: a contact this close to cortex has a column to be drawn
+        on, and one further away does not.
+
+        Four millimetres by default. Measured on a real subject, a subdural
+        grid resting on the pia stays under 1.6 mm and a depth electrode driven
+        56 mm inward stays under 2.3 mm -- cortex folds, so a shaft is never
+        far from some sulcal bank. What four millimetres excludes is a contact
+        in the deep white-matter core, in a ventricle, or outside the head.
+
+        Both directions are bounded, so an sEEG contact genuinely far from any
+        grey matter is excluded rather than drawn on a column it has no claim
+        to. Raise it, or set it to ``np.inf``, to project everything.
+
+        This is not a registration check, and the same folding that makes it
+        generous is why. A *contiguous* grid lifted 15 mm off the convexity it
+        rested on fails every contact, but a *scattered* montage shifted the
+        same 15 mm keeps more than half of them, because each stray point finds
+        some bank to land near. Use :func:`check_alignment` to ask whether the
+        coordinates are in the surfaces' space; this asks only whether an
+        individual contact has cortex near enough to be drawn on.
+    max_offset_mm : float or None
         How far an electrode may sit from the cortical column it is assigned
-        to, measured perpendicular to that column. This is the number that says
-        whether a projection means anything: a depth contact directly beneath a
-        gyral crown has a small offset however deep it is, while a contact in a
-        ventricle or outside the head does not.
-    max_above_pia_mm : float
+        to, measured perpendicular to that column. None -- the default -- for
+        no bound: the surface-distance rule above already excludes anything
+        this would catch, and it does so by a measure that survives folding.
+        Kept because it is the honest way to ask "is this contact over its own
+        column?", which is a different question from "is it near cortex?".
+    max_above_pia_mm : float or None
         How far *outside* the pial surface an electrode may sit and still be
-        placed. Subdural grid and strip contacts are legitimately a millimetre
-        or two above the pia; a contact ten centimetres above it is a
-        coordinate-space error.
+        placed, or None -- the default -- for no bound beyond the
+        surface-distance rule. Subdural grid and strip contacts are
+        legitimately a millimetre or two above the pia.
     max_below_wm_mm : float or None
         The same bound below the white-matter boundary, or None -- the default
-        -- for no bound, since sEEG contacts are legitimately deep.
+        -- for no bound beyond the surface-distance rule. Unlike that rule this
+        one is measured along the electrode's own column, so it asks "how deep
+        is this contact?" rather than "how far from cortex is it?".
     drop_unknown_anatomy : bool
         Apply the anatomy rule at all. Off by default.
     unknown_labels : sequence of str
@@ -145,8 +180,9 @@ class PlacementPolicy:
         ``ctx_lh_G_temporal_inf``) deliberately do not match.
     """
 
-    max_offset_mm: float = 10.0
-    max_above_pia_mm: float = 10.0
+    max_surface_distance_mm: float = 4.0
+    max_offset_mm: Optional[float] = None
+    max_above_pia_mm: Optional[float] = None
     max_below_wm_mm: Optional[float] = None
     drop_unknown_anatomy: bool = False
     unknown_labels: Sequence[str] = ("", "unknown", "none", "n/a", "nan")
@@ -198,6 +234,12 @@ class ElectrodeAnchors:
         measured perpendicular to that column. Falls back to the distance to
         the mid-surface triangle when there is no white matter to define a
         column.
+    dist_pia_mm : (n,) array of float
+        Distance to the nearest point on the pial surface.
+    dist_wm_mm : (n,) array of float
+        Distance to the nearest point on the white-matter surface. NaN when the
+        subject has none, in which case :attr:`surface_distance_mm` falls back
+        to the pial distance alone.
     placement : (n,) array of str
         One of the module-level placement constants.
     surface_hash : str
@@ -212,6 +254,8 @@ class ElectrodeAnchors:
     depth_mm: npt.NDArray[np.floating]
     thickness_mm: npt.NDArray[np.floating]
     offset_mm: npt.NDArray[np.floating]
+    dist_pia_mm: npt.NDArray[np.floating]
+    dist_wm_mm: npt.NDArray[np.floating]
     placement: npt.NDArray[np.str_]
     surface_hash: str = ""
 
@@ -228,9 +272,22 @@ class ElectrodeAnchors:
             depth_mm=self.depth_mm[idx],
             thickness_mm=self.thickness_mm[idx],
             offset_mm=self.offset_mm[idx],
+            dist_pia_mm=self.dist_pia_mm[idx],
+            dist_wm_mm=self.dist_wm_mm[idx],
             placement=self.placement[idx],
             surface_hash=self.surface_hash,
         )
+
+    @property
+    def surface_distance_mm(self) -> npt.NDArray[np.floating]:
+        """Distance to the nearer bounding surface, pial or white matter.
+
+        The quantity :attr:`PlacementPolicy.max_surface_distance_mm` bounds.
+        ``fmin`` rather than ``minimum``, so a subject with no white-matter
+        surface degrades to the pial distance instead of returning NaN for
+        every electrode.
+        """
+        return np.fmin(self.dist_pia_mm, self.dist_wm_mm)
 
     @property
     def placeable(self) -> npt.NDArray[np.bool_]:
@@ -421,6 +478,22 @@ def _anchor_one_hemisphere(
     depth = np.full(n, np.nan)
     thickness = np.full(n, np.nan)
     lateral = np.full(n, np.nan)
+    to_pia = np.full(n, np.nan)
+    to_wm = np.full(n, np.nan)
+
+    def nearest_on(surface: npt.NDArray[np.floating], tri: npt.NDArray[np.integer],
+                   point: npt.NDArray[np.floating]) -> float:
+        """Distance from ``point`` to the closest of ``surface``'s triangles.
+
+        Over the candidate faces only, which is the mid-surface neighbourhood
+        the search already gathered -- so this is the nearest point on the
+        columns *near* the electrode rather than a global query over the whole
+        hemisphere. The two differ only for an electrode already far outside
+        any policy, where the answer is "too far" either way.
+        """
+        w = _closest_point_weights(surface[tri], point)
+        foot = np.einsum("fij,fi->fj", surface[tri], w)
+        return float(np.linalg.norm(foot - point, axis=1).min())
 
     for i in range(n):
         cand = np.unique(
@@ -435,6 +508,10 @@ def _anchor_one_hemisphere(
             best = int(np.argmin(dist))
             face[i], weights[i], distance[i] = cand[best], w[best], dist[best]
             lateral[i] = dist[best]
+            # `mid` *is* the pial surface here, so this is the distance to the
+            # only surface there is; `to_wm` stays NaN and drops out of the
+            # policy's fmin.
+            to_pia[i] = dist[best]
             continue
 
         pial_point = np.einsum("fij,fi->fj", pia[tri], w)
@@ -457,6 +534,15 @@ def _anchor_one_hemisphere(
         thickness[i] = np.sqrt(length2[best])
         lateral[i] = np.linalg.norm(rel[best] - t[best] * column[best])
 
+        # Measured against the bounding surfaces themselves rather than derived
+        # from `depth` and `lateral`, which would only be the distance to *this*
+        # column's pial point. Cortex folds: a contact deep in white matter is
+        # routinely a millimetre from a neighbouring sulcal bank while being
+        # centimetres from its own column's pia, and it is the former that says
+        # whether projecting it means anything.
+        to_pia[i] = nearest_on(pia, tri, coords[i])
+        to_wm[i] = nearest_on(wm, tri, coords[i])
+
     verts = polys[face]
     return dict(
         verts=verts,
@@ -466,6 +552,8 @@ def _anchor_one_hemisphere(
         depth_mm=depth * thickness,
         thickness_mm=thickness,
         offset_mm=np.where(np.isfinite(lateral), lateral, distance),
+        dist_pia_mm=to_pia,
+        dist_wm_mm=to_wm,
     )
 
 
@@ -558,6 +646,8 @@ def anchor_to_surfaces(
         depth_mm=scatter(pick("depth_mm"), np.nan),
         thickness_mm=scatter(pick("thickness_mm"), np.nan),
         offset_mm=scatter(pick("offset_mm"), np.nan),
+        dist_pia_mm=scatter(pick("dist_pia_mm"), np.nan),
+        dist_wm_mm=scatter(pick("dist_wm_mm"), np.nan),
         placement=np.full(n, ON_SURFACE, dtype="<U16"),
         surface_hash=surface_hash(hemis),
     )
@@ -586,9 +676,19 @@ def classify_placement(
 
     placement = np.where(inside, ON_SURFACE, PROJECTED).astype("<U16")
 
-    too_far = anchors.offset_mm > policy.max_offset_mm
-    above = -np.minimum(anchors.depth_mm, 0.0)          # mm outside the pia
-    too_far |= np.nan_to_num(above) > policy.max_above_pia_mm
+    # The default rule, and normally the only one that fires: how far from
+    # cortex the contact is, whichever bounding surface is nearer. Every test
+    # here reads an unmeasured quantity as passing rather than failing --
+    # `nan_to_num` on a distance that was never computed -- so an anchor from an
+    # older file is kept and reported, not silently dropped.
+    surface_distance = np.nan_to_num(anchors.surface_distance_mm)
+    too_far = surface_distance > policy.max_surface_distance_mm
+
+    if policy.max_offset_mm is not None:
+        too_far |= np.nan_to_num(anchors.offset_mm) > policy.max_offset_mm
+    if policy.max_above_pia_mm is not None:
+        above = -np.minimum(anchors.depth_mm, 0.0)      # mm outside the pia
+        too_far |= np.nan_to_num(above) > policy.max_above_pia_mm
     if policy.max_below_wm_mm is not None:
         below = np.maximum(anchors.depth_mm - anchors.thickness_mm, 0.0)
         too_far |= np.nan_to_num(below) > policy.max_below_wm_mm
@@ -701,7 +801,7 @@ def check_alignment(
     coords = np.atleast_2d(np.asarray(coords, dtype=np.float64))
     anchors = anchor_to_surfaces(
         coords, hemis,
-        policy=PlacementPolicy(max_offset_mm=np.inf, max_above_pia_mm=np.inf),
+        policy=PlacementPolicy(max_surface_distance_mm=np.inf),
     )
     residuals = coords - anchors.evaluate({h: hemis[h].pia for h in hemis})
     offsets = np.linalg.norm(residuals, axis=1)

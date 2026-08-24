@@ -125,12 +125,15 @@ superficial contacts onto the near bank of a sulcus.
 Store, per electrode, computed once:
 
 ```
-hemi, verts[3], bary_w[3], depth, offset_mm, placement
+hemi, verts[3], bary_w[3], depth, offset_mm, dist_pia_mm, dist_wm_mm, placement
 ```
 
-where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3
-and `offset_mm` is the perpendicular distance from the electrode to the column
-it was assigned to.
+where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3,
+`offset_mm` is the perpendicular distance from the electrode to the column it
+was assigned to, and `dist_pia_mm` / `dist_wm_mm` are the distances to the
+nearest point on each bounding surface — measured against the surfaces
+themselves over the candidate faces, not derived from `depth` and `offset_mm`,
+which would only ever describe this electrode's own column.
 
 **Selection is by distance to the cortical column, not to the mid-surface.**
 The candidate triangles come from the mid-surface, but choosing among them by
@@ -157,6 +160,45 @@ Position on any surface is then `bary_w @ pts[verts]`, needing no polygons at
 all. Barycentric rather than nearest-vertex because contacts are 3-10 mm apart
 while vertices are ~0.5-1 mm apart: nearest-vertex snapping visibly distorts
 within-grid spacing, and barycentric costs three extra floats.
+
+**How far from cortex is too far: 4 mm to the nearest bounding surface.**
+`placement` is `too_far` when an electrode is further than
+`PlacementPolicy.max_surface_distance_mm` from the nearest point on *either*
+bounding surface, pial or white matter. Everything else the policy can bound —
+offset from the assigned column, height above the pia, depth past the white
+matter — is off unless asked for.
+
+This replaced a 10 mm bound on the column offset that was never an anatomical
+number. It came from `check_alignment(threshold_mm=10.0)`, where 10 mm *is*
+calibrated but answers a different question: a correctly placed grid gives a
+1.6 mm median offset and a 15 mm coordinate-space error gives 12.3 mm, so 10 mm
+separates "plausible" from "wrong space". Reused per contact it was a
+registration backstop standing in for a criterion nobody had written.
+
+Measured on S1, distance to the nearer bounding surface:
+
+| contacts | p50 | p90 | max |
+| --- | --- | --- | --- |
+| subdural grid, 1.5 mm above the pia | 1.50 | 1.50 | 1.56 |
+| sEEG shaft, 0–56 mm inward | 0.88 | 1.66 | 2.25 |
+
+The second row is why one number covers both ends of the montage vocabulary,
+and it is not obvious: a shaft driven nearly six centimetres in stays under
+2.3 mm from cortex, because it is threading folds the whole way. So bounding
+*both* directions does not cost the depth electrodes anything. What 4 mm
+excludes is the deep white-matter core, a ventricle, and the outside of the
+head. Pinned by `test_a_resting_grid_and_a_deep_shaft_both_clear_four_millimetres`.
+
+The same folding is why this is **not** a registration check. A contiguous grid
+lifted 15 mm fails every contact; a scattered montage shifted the same 15 mm
+keeps more than half, each stray point finding some bank to land near. That is
+`AlignmentReport`'s caveat restated — judge a montage by its grids, not its
+outliers — and `test_the_rule_catches_a_lifted_grid_but_not_scattered_contacts`
+holds both halves in place.
+
+The threshold is reachable where the decision is visible: `add_electrodes(...,
+max_surface_distance_mm=...)` re-decides it for one figure without touching the
+set's stored `placement`, so a drawing never changes what a later viewer shows.
 
 **`placement` is an explicit enum on every electrode**, never a silent drop:
 `on_surface`, `projected`, `too_far`, `unknown_anatomy`. The design document's

@@ -296,8 +296,36 @@ def test_json_round_trip_keeps_the_anchors(eset, hemis, tmp_path):
     assert np.allclose(back.anchors.weights, eset.anchors.weights)
     assert np.allclose(back.anchors.depth, eset.anchors.depth)
     assert list(back.anchors.placement) == list(eset.anchors.placement)
+    assert np.allclose(back.anchors.dist_pia_mm, eset.anchors.dist_pia_mm)
+    assert np.allclose(back.anchors.dist_wm_mm, eset.anchors.dist_wm_mm)
     assert back.anchors.surface_hash == eset.anchors.surface_hash
     assert back.subject == "TEST"
+
+
+def test_a_file_without_surface_distances_gets_a_usable_fallback(eset, hemis, tmp_path):
+    """Files written before the surface-distance rule carry no such field.
+
+    Leaving them NaN would make ``reclassify()`` on an old file accept every
+    contact, however far from cortex, and say nothing about it. The distance to
+    the contact's own column is the honest reconstruction: an upper bound on
+    the real one, since it cannot see a nearer sulcal bank.
+    """
+    import json
+
+    eset.anchor(surfaces=hemis)
+    path = tmp_path / "e.json"
+    save_electrodes_json(eset, path)
+    payload = json.loads(path.read_text())
+    del payload["anchors"]["dist_pia_mm"], payload["anchors"]["dist_wm_mm"]
+    path.write_text(json.dumps(payload))
+
+    back = load_electrodes_json(path)
+    assert np.isfinite(back.anchors.surface_distance_mm).all()
+    # The fixture's contacts sit 1 mm above a 3 mm ribbon, straight over their
+    # own columns, so the reconstruction is exact there.
+    assert np.allclose(back.anchors.dist_pia_mm, 1.0, atol=1e-6)
+    assert np.allclose(back.anchors.dist_wm_mm, 4.0, atol=1e-6)
+    assert back.anchors.surface_distance_mm.max() >= back.anchors.dist_pia_mm.max()
 
 
 def test_json_round_trip_without_anchors(eset, tmp_path):

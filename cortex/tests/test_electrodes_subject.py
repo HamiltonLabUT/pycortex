@@ -17,6 +17,7 @@ import pytest
 import cortex
 from cortex.electrodes import (
     ElectrodeSet,
+    anchor_to_surfaces,
     check_alignment,
     load_surface_pairs,
 )
@@ -190,6 +191,61 @@ def test_a_grid_lifted_off_the_surface_is_caught(grid_electrodes, pairs, shift_m
     # 15 mm) rather than tracking it.
     shift = report.systematic_shift_mm
     assert np.argmax(np.abs(shift)) == 2 and shift[2] > 0
+
+
+# -- the surface-distance rule, on a folded brain --------------------------
+
+def test_a_resting_grid_and_a_deep_shaft_both_clear_four_millimetres(pairs):
+    """The measurement the 4 mm default was chosen from.
+
+    Both ends of the montage vocabulary have to fit under one threshold or the
+    number is useless: a subdural grid lying on the pia, and a depth electrode
+    driven the better part of six centimetres inward. They do, and for
+    different reasons -- the grid because it is *on* the surface, the shaft
+    because cortex folds so densely that it is never far from a sulcal bank.
+    That second fact is the whole reason one number can cover both.
+    """
+    from cortex import polyutils
+
+    pair = pairs["lh"]
+    surf = polyutils.Surface(pair.pia.astype(np.float64), pair.polys)
+    normals = np.asarray(surf.vertex_normals)
+    patch = np.argsort(np.linalg.norm(pair.pia - pair.pia[40000], axis=1))[:64]
+
+    grid = anchor_to_surfaces(pair.pia[patch] + 1.5 * normals[patch], pairs)
+    assert grid.surface_distance_mm.max() < 2.0
+    assert grid.placeable.all()
+
+    shaft = anchor_to_surfaces(
+        pair.pia[patch[0]] - np.outer(np.arange(0, 60, 4.0), normals[patch[0]]), pairs
+    )
+    assert shaft.surface_distance_mm.max() < 4.0
+    assert shaft.placeable.all()
+
+
+def test_the_rule_catches_a_lifted_grid_but_not_scattered_contacts(
+    grid_electrodes, pairs, midpoint_electrodes
+):
+    """What the threshold does and does not amount to.
+
+    Lift a *contiguous* grid 15 mm off the convexity it was resting on and
+    every contact fails: there is nothing under it any more, and the default
+    rule rejects the lot. Do the same to a *scattered* set and most contacts
+    survive, because each one lands somewhere in the folds. So the rule is not
+    a registration check -- ``check_alignment`` is -- and a montage that passes
+    it contact by contact can still be in the wrong space. Same caveat as
+    :class:`~cortex.electrodes.AlignmentReport`'s: judge a montage by its
+    grids, not by its outliers.
+    """
+    lift = np.array([0.0, 0.0, 15.0])
+
+    lifted_grid = anchor_to_surfaces(grid_electrodes + lift, pairs)
+    assert not lifted_grid.placeable.any()
+    assert lifted_grid.surface_distance_mm.min() > 4.0
+
+    eset, _, _ = midpoint_electrodes
+    scattered = anchor_to_surfaces(eset.coords + lift, pairs)
+    assert scattered.placeable.mean() > 0.5
 
 
 def test_a_grid_slid_along_the_surface_is_not_caught(grid_electrodes, pairs):

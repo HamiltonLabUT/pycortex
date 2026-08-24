@@ -190,6 +190,8 @@ def to_dict(eset: ElectrodeSet) -> dict[str, Any]:
             "depth_mm": _nan_to_none(anchors.depth_mm),
             "thickness_mm": _nan_to_none(anchors.thickness_mm),
             "offset_mm": _nan_to_none(anchors.offset_mm),
+            "dist_pia_mm": _nan_to_none(anchors.dist_pia_mm),
+            "dist_wm_mm": _nan_to_none(anchors.dist_wm_mm),
             "placement": [str(p) for p in anchors.placement],
             "surface_hash": anchors.surface_hash,
         }
@@ -201,14 +203,30 @@ def from_dict(payload: dict[str, Any]) -> ElectrodeSet:
     anchors = None
     if payload.get("anchors"):
         raw = payload["anchors"]
+        offset = _none_to_nan(raw["offset_mm"])
+        depth_mm = _none_to_nan(raw["depth_mm"])
+        thickness = _none_to_nan(raw["thickness_mm"])
+        # Files written before the surface-distance rule carry no measured
+        # distance to the pia or the white matter. Reconstruct the closest
+        # thing the stored fields support -- the distance to this column's own
+        # pial and white-matter points -- rather than leaving NaN, which would
+        # make `reclassify()` on an old file silently accept everything. It is
+        # an upper bound on the real distance, since it cannot see a nearer
+        # sulcal bank; re-anchoring replaces it with the measured value.
+        dist_pia = _none_to_nan(raw["dist_pia_mm"]) if "dist_pia_mm" in raw \
+            else np.hypot(offset, depth_mm)
+        dist_wm = _none_to_nan(raw["dist_wm_mm"]) if "dist_wm_mm" in raw \
+            else np.hypot(offset, depth_mm - thickness)
         anchors = ElectrodeAnchors(
             hemi=np.array(raw["hemi"], dtype=str),
             verts=np.array(raw["verts"], dtype=np.intp),
             weights=np.array(raw["weights"], dtype=np.float64),
             depth=_none_to_nan(raw["depth"]),
-            depth_mm=_none_to_nan(raw["depth_mm"]),
-            thickness_mm=_none_to_nan(raw["thickness_mm"]),
-            offset_mm=_none_to_nan(raw["offset_mm"]),
+            depth_mm=depth_mm,
+            thickness_mm=thickness,
+            offset_mm=offset,
+            dist_pia_mm=dist_pia,
+            dist_wm_mm=dist_wm,
             placement=np.array(raw["placement"], dtype=str),
             surface_hash=raw.get("surface_hash", ""),
         )
