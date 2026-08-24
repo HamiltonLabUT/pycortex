@@ -21,6 +21,7 @@ import numpy as np
 import numpy.typing as npt
 
 from ._anchor import HEMIS
+from ._connect import group_edges
 
 if TYPE_CHECKING:
     from ._set import ElectrodeSet
@@ -64,6 +65,8 @@ def to_viewer_json(
     placeable_only: bool = True,
     radius: float = 1.5,
     color: str = "#ffcc33",
+    connections: bool = True,
+    line_color: Optional[str] = None,
 ) -> dict[str, Any]:
     """Serialise an electrode set for the browser.
 
@@ -91,6 +94,14 @@ def to_viewer_json(
     color : str
         A CSS colour for every marker. One colour is all this carries -- colour
         by data value belongs with the ``Electrode`` views and their colormap.
+    connections : bool
+        Join contacts that are neighbours on the same device with a line, so a
+        montage reads as devices rather than as a cloud of dots. Which pairs are
+        neighbours is decided by :func:`~cortex.electrodes._connect.group_edges`;
+        this only says whether to work them out and send them.
+    line_color : str, optional
+        A CSS colour for those lines. The marker ``color`` by default, which
+        keeps a device reading as one object.
 
     Returns
     -------
@@ -114,10 +125,12 @@ def to_viewer_json(
         left_nverts = len(db.get_surf(eset.subject, "pia", "lh")[0])
 
     contacts = []
+    drawn = []
     for i in np.flatnonzero(keep):
         hemi = str(anchors.hemi[i])
         if hemi not in HEMIS:
             continue
+        drawn.append(i)
         contacts.append({
             # Its position in the montage. The browser needs it because this
             # function *drops* contacts -- unplaceable ones, and any whose
@@ -149,13 +162,27 @@ def to_viewer_json(
             "placement": str(anchors.placement[i]),
         })
 
+    # Edges index into `contacts`, not into `eset`, and are worked out from the
+    # contacts that survived `keep` rather than from all of them. A contact the
+    # placement policy rejected is not drawn, so it has no position for a line
+    # to reach -- and chaining straight past the gap keeps a shank with one
+    # unplaceable contact a single unbroken probe.
+    drawn = np.asarray(drawn, dtype=int)
+    edges = [] if not connections else group_edges(
+        eset.coords[drawn], eset.group[drawn], eset.group_type[drawn],
+        names=eset.names[drawn],
+    )
+
     return {
         "electrodes": contacts,
+        "edges": [[int(a), int(b)] for a, b in edges],
+        "connections": bool(connections),
         # How long a montage-indexed array should be, so the browser can notice
         # when it is handed one that does not match.
         "nelec": int(len(eset)),
         "radius": float(radius),
         "color": color,
+        "line_color": color if line_color is None else line_color,
         "subject": eset.subject,
     }
 
