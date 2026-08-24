@@ -69,6 +69,7 @@ from ._set import (
     infer_group,
     infer_index,
     load_surface_pairs,
+    surface_space_offset,
 )
 
 __all__ = [
@@ -86,6 +87,7 @@ __all__ = [
     "anchor_to_surfaces",
     "classify_placement",
     "load_surface_pairs",
+    "surface_space_offset",
     "surface_hash",
     "ON_SURFACE",
     "PROJECTED",

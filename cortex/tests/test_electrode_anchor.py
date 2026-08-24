@@ -112,9 +112,24 @@ def test_a_deep_contact_gets_depth_past_one(hemis):
     anchors = anchor_to_surfaces(coords, hemis)
     assert np.isclose(anchors.depth[0], 3.0)
     assert np.isclose(anchors.depth_mm[0], 9.0)
-    assert anchors.placement[0] == PROJECTED
     # Directly beneath its own column, so it is deep rather than misplaced.
     assert np.isclose(anchors.offset_mm[0], 0.0, atol=1e-9)
+
+
+def test_how_deep_is_too_deep_is_the_surface_distance_rule(hemis):
+    """Six millimetres past the white matter of an *unfolded* test sheet.
+
+    On real cortex a contact this deep is still a millimetre or two from some
+    sulcal bank and stays placed; these sheets are flat, so nothing is near it
+    and the default four-millimetre rule excludes it. That is the rule working,
+    not a quirk of the fixture -- and it is one number away from not applying.
+    """
+    coords = np.array([[20.0, 0.0, -9.0]])
+    assert anchor_to_surfaces(coords, hemis).placement[0] == TOO_FAR
+    relaxed = anchor_to_surfaces(
+        coords, hemis, policy=PlacementPolicy(max_surface_distance_mm=10.0)
+    )
+    assert relaxed.placement[0] == PROJECTED
 
 
 def test_mid_ribbon_contact_is_on_surface(hemis):
@@ -162,6 +177,9 @@ def test_a_contact_far_off_its_column_is_flagged(hemis):
     anchors = anchor_to_surfaces(np.array([[60.0, 0.0, 0.0]]), hemis)
     assert anchors.placement[0] == TOO_FAR
     assert anchors.offset_mm[0] > 10.0
+    # Excluded by the surface-distance rule, which is on by default, rather
+    # than by the column-offset bound, which is not.
+    assert anchors.surface_distance_mm[0] > 4.0
 
 
 def test_a_contact_far_above_the_pia_is_flagged(hemis):
@@ -169,12 +187,85 @@ def test_a_contact_far_above_the_pia_is_flagged(hemis):
     assert anchors.placement[0] == TOO_FAR
 
 
+# -- the surface-distance rule ---------------------------------------------
+
+@pytest.mark.parametrize(
+    "height, expected",
+    [(3.5, PROJECTED), (4.5, TOO_FAR)],
+)
+def test_four_millimetres_from_a_surface_is_the_default_rule(hemis, height, expected):
+    """The one number that decides whether a contact is drawn at all.
+
+    Straight above the pia, so the distance to it is the height and there is no
+    second effect to disentangle.
+    """
+    anchors = anchor_to_surfaces(np.array([[-20.0, 0.0, height]]), hemis)
+    assert np.isclose(anchors.dist_pia_mm[0], height, atol=1e-6)
+    assert anchors.placement[0] == expected
+
+
+def test_the_rule_is_a_number_the_caller_sets(hemis):
+    coords = np.array([[-20.0, 0.0, 6.0]])
+    assert anchor_to_surfaces(coords, hemis).placement[0] == TOO_FAR
+    for threshold in (8.0, np.inf):
+        anchors = anchor_to_surfaces(
+            coords, hemis,
+            policy=PlacementPolicy(max_surface_distance_mm=threshold),
+        )
+        assert anchors.placement[0] == PROJECTED
+
+
+def test_distance_is_measured_to_both_surfaces(hemis):
+    """A contact just under the white matter is far from the pia and near it.
+
+    ``surface_distance_mm`` takes the nearer, which is what makes one threshold
+    cover a subdural grid and a depth contact without special-casing either.
+    """
+    anchors = anchor_to_surfaces(np.array([[-20.0, 0.0, -4.0]]), hemis)
+    assert np.isclose(anchors.dist_pia_mm[0], 4.0, atol=1e-6)
+    assert np.isclose(anchors.dist_wm_mm[0], 1.0, atol=1e-6)
+    assert np.isclose(anchors.surface_distance_mm[0], 1.0, atol=1e-6)
+    assert anchors.placement[0] == PROJECTED
+
+
+def test_the_rule_still_works_without_a_white_matter_surface():
+    """``fmin``, not ``minimum``: a NaN white-matter distance must not swallow
+    the pial one and reject every contact the subject has."""
+    pia, polys = plane(-30.0, -10.0)
+    hemis = {"lh": SurfacePair(pia=pia, polys=polys)}
+    near = anchor_to_surfaces(np.array([[-20.0, 0.0, 2.0]]), hemis)
+    assert np.isnan(near.dist_wm_mm[0])
+    assert np.isclose(near.surface_distance_mm[0], 2.0, atol=1e-6)
+    assert near.placement[0] == PROJECTED
+    far = anchor_to_surfaces(np.array([[-20.0, 0.0, 9.0]]), hemis)
+    assert far.placement[0] == TOO_FAR
+
+
+def test_the_column_offset_bound_is_opt_in(hemis):
+    """Off by default, and still the honest way to ask "over its own column?".
+
+    These flat sheets cannot produce a contact that is near cortex *and* far
+    off its own column -- that needs folding -- so the offset is set by hand to
+    isolate the bound from the surface-distance rule that would otherwise fire
+    first.
+    """
+    anchors = anchor_to_surfaces(np.array([[-20.0, 0.0, -0.5]]), hemis)
+    assert anchors.placement[0] == ON_SURFACE
+    anchors.offset_mm = np.array([5.0])
+    assert classify_placement(anchors, PlacementPolicy())[0] == ON_SURFACE
+    assert classify_placement(
+        anchors, PlacementPolicy(max_offset_mm=1.0)
+    )[0] == TOO_FAR
+
+
 def test_policy_is_reapplied_without_redoing_the_geometry(hemis):
     coords = np.array([[60.0, 0.0, 0.0]])
     anchors = anchor_to_surfaces(coords, hemis)
     assert anchors.placement[0] == TOO_FAR
 
-    relaxed = classify_placement(anchors, PlacementPolicy(max_offset_mm=100.0))
+    relaxed = classify_placement(
+        anchors, PlacementPolicy(max_surface_distance_mm=100.0)
+    )
     assert relaxed[0] == ON_SURFACE
     # and the expensive part is untouched
     assert np.array_equal(anchors.verts[0], anchor_to_surfaces(coords, hemis).verts[0])
@@ -208,11 +299,20 @@ def test_the_anatomy_rule_needs_labels(hemis):
         )
 
 
-def test_below_white_matter_bound_is_opt_in(hemis):
+def test_below_white_matter_bound_is_a_separate_opt_in_measure(hemis):
+    """``max_below_wm_mm`` asks how deep, not how far from cortex.
+
+    The two coincide on these unfolded sheets and part company on a real brain,
+    where a deep contact beside a sulcal bank is far past the white matter and
+    still close to cortex. Keeping both means a montage can be filtered by
+    either question.
+    """
     coords = np.array([[20.0, 0.0, -40.0]])
-    assert anchor_to_surfaces(coords, hemis).placement[0] == PROJECTED
+    relaxed = PlacementPolicy(max_surface_distance_mm=np.inf)
+    assert anchor_to_surfaces(coords, hemis, policy=relaxed).placement[0] == PROJECTED
     bounded = anchor_to_surfaces(
-        coords, hemis, policy=PlacementPolicy(max_below_wm_mm=10.0)
+        coords, hemis,
+        policy=PlacementPolicy(max_surface_distance_mm=np.inf, max_below_wm_mm=10.0),
     )
     assert bounded.placement[0] == TOO_FAR
 
@@ -265,6 +365,44 @@ def test_a_uniform_shift_is_caught(hemis):
     assert "SUSPICIOUS" in report.summary()
     assert np.isclose(report.systematic_shift_mm[2], 50.0, atol=1.0)
     assert np.isclose(report.shift_magnitude_mm, 50.0, atol=1.0)
+
+
+def test_placeholder_rows_are_excluded_rather_than_propagated(hemis):
+    """One NaN row used to turn every statistic in the report into NaN.
+
+    Real montages carry these in quantity -- placeholder rows for unconnected
+    amplifier channels -- so a report that cannot survive one is a report that
+    says nothing about most real files. Measured on a clinical montage: 14 of
+    100 rows, and the whole summary came back NaN.
+    """
+    coords = np.array([
+        [-20.0, 0.0, 1.0],
+        [np.nan, np.nan, np.nan],
+        [-22.0, 2.0, 1.5],
+        [20.0, -4.0, np.nan],
+    ])
+    report = check_alignment(coords, hemis)
+    assert np.isfinite(report.median_offset_mm)
+    assert np.isfinite(report.systematic_shift_mm).all()
+    assert report.n_electrodes == 2 and report.n_skipped == 2
+    assert "2 rows skipped" in report.summary()
+
+
+def test_a_single_skipped_row_reads_as_singular(hemis):
+    coords = np.array([[-20.0, 0.0, 1.0], [np.nan, 0.0, 0.0]])
+    assert "1 row skipped" in check_alignment(coords, hemis).summary()
+
+
+def test_a_montage_with_no_finite_coordinate_is_refused(hemis):
+    """Nothing was measured, so there is no report to make."""
+    with pytest.raises(ValueError, match="finite coordinate"):
+        check_alignment(np.full((3, 3), np.nan), hemis)
+
+
+def test_a_clean_montage_reports_nothing_skipped(hemis):
+    report = check_alignment(np.array([[-20.0, 0.0, 1.0]]), hemis)
+    assert report.n_skipped == 0
+    assert "skipped" not in report.summary()
 
 
 def test_the_surface_hash_tracks_the_surfaces(hemis):

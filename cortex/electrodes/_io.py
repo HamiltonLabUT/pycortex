@@ -190,6 +190,8 @@ def to_dict(eset: ElectrodeSet) -> dict[str, Any]:
             "depth_mm": _nan_to_none(anchors.depth_mm),
             "thickness_mm": _nan_to_none(anchors.thickness_mm),
             "offset_mm": _nan_to_none(anchors.offset_mm),
+            "dist_pia_mm": _nan_to_none(anchors.dist_pia_mm),
+            "dist_wm_mm": _nan_to_none(anchors.dist_wm_mm),
             "placement": [str(p) for p in anchors.placement],
             "surface_hash": anchors.surface_hash,
         }
@@ -201,14 +203,30 @@ def from_dict(payload: dict[str, Any]) -> ElectrodeSet:
     anchors = None
     if payload.get("anchors"):
         raw = payload["anchors"]
+        offset = _none_to_nan(raw["offset_mm"])
+        depth_mm = _none_to_nan(raw["depth_mm"])
+        thickness = _none_to_nan(raw["thickness_mm"])
+        # Files written before the surface-distance rule carry no measured
+        # distance to the pia or the white matter. Reconstruct the closest
+        # thing the stored fields support -- the distance to this column's own
+        # pial and white-matter points -- rather than leaving NaN, which would
+        # make `reclassify()` on an old file silently accept everything. It is
+        # an upper bound on the real distance, since it cannot see a nearer
+        # sulcal bank; re-anchoring replaces it with the measured value.
+        dist_pia = _none_to_nan(raw["dist_pia_mm"]) if "dist_pia_mm" in raw \
+            else np.hypot(offset, depth_mm)
+        dist_wm = _none_to_nan(raw["dist_wm_mm"]) if "dist_wm_mm" in raw \
+            else np.hypot(offset, depth_mm - thickness)
         anchors = ElectrodeAnchors(
             hemi=np.array(raw["hemi"], dtype=str),
             verts=np.array(raw["verts"], dtype=np.intp),
             weights=np.array(raw["weights"], dtype=np.float64),
             depth=_none_to_nan(raw["depth"]),
-            depth_mm=_none_to_nan(raw["depth_mm"]),
-            thickness_mm=_none_to_nan(raw["thickness_mm"]),
-            offset_mm=_none_to_nan(raw["offset_mm"]),
+            depth_mm=depth_mm,
+            thickness_mm=thickness,
+            offset_mm=offset,
+            dist_pia_mm=dist_pia,
+            dist_wm_mm=dist_wm,
             placement=np.array(raw["placement"], dtype=str),
             surface_hash=raw.get("surface_hash", ""),
         )
@@ -298,8 +316,17 @@ def read_elecs_mat(
     on. Three arrays, of which only the first is required:
 
     ``elecmatrix``
-        ``(n, 3)`` coordinates in FreeSurfer surface RAS -- the same space
-        pycortex holds its surfaces in, so no transform is needed.
+        ``(n, 3)`` coordinates in FreeSurfer surface RAS, better known as
+        TkRegRAS. Stored verbatim: this is the montage's own coordinate and the
+        set keeps it unaltered.
+
+        It is *not* necessarily the space pycortex holds its surfaces in.
+        :func:`cortex.freesurfer.import_subj` converts them with
+        ``mris_convert --to-scanner``, which adds ``c_ras`` -- three to five
+        millimetres on a typical scan. :func:`~cortex.electrodes.surface_space_offset`
+        reads which space a subject's surfaces are in and anchoring applies the
+        difference, so nothing here needs adjusting; but a caller comparing
+        these coordinates against surface vertices by hand does.
     ``eleclabels``
         ``(n, 3)`` cell array: short channel name, long channel name, device
         type (``grid``, ``strip``, ``depth``).

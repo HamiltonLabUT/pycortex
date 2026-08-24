@@ -106,7 +106,9 @@ def make_figure(braindata: dataset.Dataview, recache: bool=False, pixelwise: boo
         own.
     electrode_kwargs : dict, optional
         Passed to :func:`cortex.quickflat.composite.add_electrodes` -- ``depth``,
-        ``marker``, ``size_by``, ``cmap`` and the rest.
+        ``marker``, ``size_by``, ``cmap`` and the rest. ``{"max_surface_distance_mm":
+        8.0}`` is how to loosen how near cortex a contact must be to be drawn at
+        all, which defaults to 4 mm.
 
     Other Parameters
     ----------------

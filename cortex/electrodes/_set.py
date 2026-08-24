@@ -421,14 +421,24 @@ class ElectrodeSet:
         surfaces : mapping, optional
             Pre-loaded ``{"lh": SurfacePair, "rh": SurfacePair}``, which skips
             the database entirely -- useful for testing and for surfaces
-            pycortex does not hold.
+            pycortex does not hold. Taken to be in the same space as
+            :attr:`coords`, so no offset is applied: passing surfaces means
+            taking responsibility for the frame they are in.
         inplace : bool
             Store the result on the set as well as returning it.
 
         Returns
         -------
         ElectrodeAnchors
+
+        Notes
+        -----
+        Electrode coordinates are TkRegRAS; a subject's stored surfaces may not
+        be. :func:`surface_space_offset` reads which, and the difference is
+        added here rather than to :attr:`coords`, so the set keeps the
+        coordinates its montage file actually contains.
         """
+        offset = np.zeros(3)
         if surfaces is None:
             subject = subject or self.subject
             if subject is None:
@@ -436,8 +446,9 @@ class ElectrodeSet:
                     "anchoring needs a subject, either on the set or as an argument"
                 )
             surfaces = load_surface_pairs(subject)
+            offset = surface_space_offset(subject)
         anchors = anchor_to_surfaces(
-            self.coords, surfaces, policy=policy, anatomy=self.anatomy
+            self.coords + offset, surfaces, policy=policy, anatomy=self.anatomy
         )
         if inplace:
             self.anchors = anchors
@@ -480,6 +491,81 @@ class ElectrodeSet:
 
         left, right = db.get_surf(subject, surface_type, "both", nudge=nudge)
         return self.anchors.evaluate({"lh": left[0], "rh": right[0]})
+
+
+#: GIFTI's code for "these coordinates are in the scanner's frame"
+#: (``NIFTI_XFORM_SCANNER_ANAT``), as written into a darray's coordinate system.
+_SCANNER_ANAT = 1
+
+
+def surface_space_offset(subject: str) -> npt.NDArray[np.floating]:
+    """What to add to a TkRegRAS coordinate to reach ``subject``'s surfaces.
+
+    Electrode coordinates are TkRegRAS -- that is what ``img_pipe`` writes into
+    ``elecmatrix``, and what every montage format in use here carries. The
+    surfaces are not necessarily in that space. :func:`cortex.freesurfer.import_subj`
+    converts them with ``mris_convert --to-scanner``, deliberately, so that they
+    share a frame with the volume data the transform machinery works in. That
+    conversion adds FreeSurfer's ``c_ras``: the scanner-RAS coordinate of the
+    volume's centre, which TkRegRAS puts at the origin by construction.
+
+    So on such a subject an electrode dropped straight onto the surfaces lands
+    ``|c_ras|`` away from where it belongs -- three to five millimetres on a
+    typical scan, enough to move a contact to the neighbouring gyrus and not
+    nearly enough to look wrong.
+
+    Nothing geometric can catch this. Cortex folds densely enough that a
+    displaced contact finds another bank to sit against: measured here, a
+    montage shifted 20 mm still had most contacts within 2 mm of some surface,
+    and :class:`~cortex.electrodes.AlignmentReport` documents the same blindness
+    for its own check. The only reliable witness is the surface file's own
+    provenance, which is what this reads.
+
+    Returns
+    -------
+    (3,) array
+        ``c_ras`` when the surfaces declare themselves to be in scanner space,
+        and zeros when they are already TkRegRAS -- as for a subject imported
+        by some other route, or the bundled ``S1``.
+
+    Raises
+    ------
+    ValueError
+        When the surfaces say they are in scanner space but do not record the
+        ``c_ras`` needed to undo it. Refusing is the point: the alternative is
+        a montage silently misplaced by a few millimetres, which is exactly the
+        failure this function exists to prevent.
+    """
+    import nibabel as nib
+
+    from ..database import db
+
+    try:
+        path = db.get_paths(subject)["surfs"]["pia"]["lh"]
+    except KeyError:
+        return np.zeros(3)
+    if not str(path).endswith(".gii"):
+        # Only GIFTI carries the provenance this reads. Another format means
+        # another import route, which did not run `mris_convert --to-scanner`.
+        return np.zeros(3)
+
+    darray = nib.load(path).darrays[0]
+    coordsys = darray.coordsys
+    if coordsys is None or coordsys.dataspace != _SCANNER_ANAT:
+        return np.zeros(3)
+
+    meta = dict(darray.meta)
+    try:
+        c_ras = [float(meta["VolGeomC_" + axis]) for axis in "RAS"]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            "%s's surfaces declare scanner space (they were imported with "
+            "`mris_convert --to-scanner`) but record no VolGeomC, so the c_ras "
+            "shift between them and TkRegRAS electrode coordinates cannot be "
+            "undone. Re-import the subject, or anchor against surfaces passed "
+            "in directly." % subject
+        )
+    return np.asarray(c_ras, dtype=np.float64)
 
 
 def load_surface_pairs(subject: str) -> dict[str, SurfacePair]:

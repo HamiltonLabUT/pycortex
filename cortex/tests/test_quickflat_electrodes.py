@@ -159,6 +159,46 @@ def test_rejected_electrodes_are_not_drawn(flatfig, eset):
     assert _n_drawn(add_electrodes(flatfig, rejected, placeable_only=False)) == len(eset)
 
 
+def test_the_surface_distance_threshold_is_settable_per_figure(flatfig, eset):
+    """How near cortex a contact must be to be drawn, as a figure argument.
+
+    Half these contacts are *on* the pia and half are mid-ribbon, about 1.0 to
+    1.7 mm from either bounding surface, so a threshold between the two splits
+    the montage exactly in half. All twelve clear the 4 mm default.
+    """
+    assert _n_drawn(add_electrodes(flatfig, eset)) == len(eset)
+    assert _n_drawn(
+        add_electrodes(flatfig, eset, max_surface_distance_mm=np.inf)
+    ) == len(eset)
+    assert _n_drawn(add_electrodes(flatfig, eset, max_surface_distance_mm=0.5)) == 6
+
+
+def test_a_contact_the_default_rejects_can_be_drawn_by_raising_it(flatfig, eset):
+    """Two centimetres out along +z, which is what it takes on a real brain.
+
+    These twelve contacts are scattered rather than contiguous, and cortex
+    folds densely enough that most of them still find a bank a millimetre or
+    two away after the shift. A contiguous grid does not -- see
+    ``test_electrodes_subject.test_the_rule_catches_a_lifted_grid_but_not_scattered_contacts``.
+    """
+    lifted = eset[:]
+    lifted.coords = lifted.coords + np.array([0.0, 0.0, 20.0])
+    lifted.anchor()
+    default = _n_drawn(add_electrodes(flatfig, lifted))
+    assert 0 < default < len(lifted)
+    assert _n_drawn(
+        add_electrodes(flatfig, lifted, max_surface_distance_mm=np.inf)
+    ) == len(lifted)
+
+
+def test_drawing_a_figure_does_not_reclassify_the_set(flatfig, eset):
+    """A threshold passed to one figure must not follow the set to the next one,
+    or to a viewer. `placement` belongs to the anchor, not to a drawing."""
+    before = list(eset.anchors.placement)
+    add_electrodes(flatfig, eset, max_surface_distance_mm=0.001)
+    assert list(eset.anchors.placement) == before
+
+
 # -- values and colours ----------------------------------------------------
 
 def test_values_are_colormapped(flatfig, eset):

@@ -706,6 +706,7 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
                    subject: Optional[str]=None,
                    depth: Optional[Union[float, tuple[float, float]]]=None,
                    depth_tol: float=0.25, placeable_only: bool=True,
+                   max_surface_distance_mm: Optional[float]=None,
                    cmap: Optional[str]=None, vmin: Optional[float]=None, vmax: Optional[float]=None,
                    color: Optional[Union[ColorType, npt.NDArray]]=None,
                    size: float=36.0, size_by: Optional[str]=None,
@@ -750,9 +751,24 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
         Half-width of the band kept when ``depth`` is a single value.
     placeable_only : bool
         Drop electrodes the placement policy rejected -- those too far from any
-        cortical column to have an honest surface position. On by default; the
-        rejected ones are still in the set, so turning this off shows what was
-        excluded rather than resurrecting anything.
+        cortical column to have an honest surface position, which by default
+        means more than 4 mm from the nearest pial or white-matter surface. On
+        by default; the rejected ones are still in the set, so turning this off
+        shows what was excluded rather than resurrecting anything.
+    max_surface_distance_mm : float, optional
+        Override that distance for this figure: how far a contact may sit from
+        the nearest point on the pial *or* white-matter surface and still be
+        drawn. Larger projects more, ``np.inf`` projects everything that has a
+        coordinate. None -- the default -- uses whatever policy the set was
+        anchored under, which is
+        :class:`~cortex.electrodes.PlacementPolicy`'s 4 mm unless it was
+        anchored deliberately otherwise.
+
+        Only the geometric distance is re-decided; an anatomy rule the set was
+        anchored under still applies. Ignored when ``placeable_only`` is False,
+        which already means "draw everything". Applies to this figure alone:
+        the set's own ``placement`` is left as it was, so drawing a flatmap
+        never changes what a later viewer or figure shows.
     cmap : str, optional
         Colormap for ``values``. Defaults to matplotlib's current default.
     vmin, vmax : float, optional
@@ -860,7 +876,20 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
 
     keep = np.ones(len(electrodes), dtype=bool)
     if placeable_only:
-        keep &= anchors.placeable
+        if max_surface_distance_mm is None:
+            keep &= anchors.placeable
+        else:
+            # Re-decide the distance term for this figure only, leaving the
+            # set's own `placement` alone: drawing a figure must not change what
+            # a later figure or viewer shows. Only the geometry is revisited --
+            # a contact excluded by an anatomy rule, or with no coordinate at
+            # all, stays excluded however generous the distance is.
+            from ..electrodes import NO_COORDINATE, UNKNOWN_ANATOMY
+
+            within = (np.nan_to_num(anchors.surface_distance_mm)
+                      <= max_surface_distance_mm)
+            other = np.isin(anchors.placement, [UNKNOWN_ANATOMY, NO_COORDINATE])
+            keep &= within & ~other
     if depth is not None:
         d = electrodes.depth
         if isinstance(depth, (int, float, np.floating, np.integer)):

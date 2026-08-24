@@ -117,6 +117,18 @@ def to_viewer_json(
     anchors = eset.anchors
     keep = anchors.placeable if placeable_only else np.ones(len(eset), dtype=bool)
 
+    # The viewer draws `coords` directly against the CTM, which is built from
+    # the subject's stored surfaces -- so the coordinates have to be in *their*
+    # space, not the montage's. On a subject imported with
+    # `mris_convert --to-scanner` those differ by c_ras, and a contact sent
+    # unconverted is drawn a few millimetres off, on the neighbouring gyrus.
+    offset = np.zeros(3)
+    if eset.subject is not None:
+        from ._set import surface_space_offset
+
+        offset = surface_space_offset(eset.subject)
+    coords = eset.coords + offset
+
     if ctm_index is not None and left_nverts is None:
         from ..database import db
 
@@ -142,11 +154,11 @@ def to_viewer_json(
             "group": str(eset.group[i]),
             "group_type": str(eset.group_type[i]).lower(),
             "hemi": _VIEWER_HEMI[hemi],
-            # The measured TkRegRAS position, sent alongside the anchor. The
-            # viewer shows this one on the anatomical surface -- where a
-            # coordinate is still meaningful -- and crosses over to the anchor
-            # as soon as the surface starts to deform.
-            "coords": [float(x) for x in eset.coords[i]],
+            # The measured position in the surfaces' own space, sent alongside
+            # the anchor. The viewer shows this one on the anatomical surface --
+            # where a coordinate is still meaningful -- and crosses over to the
+            # anchor as soon as the surface starts to deform.
+            "coords": [float(x) for x in coords[i]],
             "verts": _ctm_verts(anchors.verts[i], hemi, ctm_index, left_nverts),
             "weights": [float(w) for w in anchors.weights[i]],
             "depth": _finite(anchors.depth[i]),
@@ -168,8 +180,12 @@ def to_viewer_json(
     # to reach -- and chaining straight past the gap keeps a shank with one
     # unplaceable contact a single unbroken probe.
     drawn = np.asarray(drawn, dtype=int)
+    # The same surface-space coordinates the markers are drawn at. Which pairs
+    # are neighbours is decided from a device's own contacts, so it is invariant
+    # to the shift and either array gives the same edges -- but one function
+    # holding two coordinate frames is how the next mistake gets made.
     edges = [] if not connections else group_edges(
-        eset.coords[drawn], eset.group[drawn], eset.group_type[drawn],
+        coords[drawn], eset.group[drawn], eset.group_type[drawn],
         names=eset.names[drawn],
     )
 

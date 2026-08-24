@@ -53,14 +53,55 @@ is drawn with that extent. So an electrode's flat position — read straight out
 `add_rois`, roughly forty lines, with no new cache and no change to
 `make_flatmap_image`.
 
-### 1.4 TkRegRAS is very likely already the surface coordinate system
+### 1.4 TkRegRAS is *not* the surface coordinate system — this was wrong
 
-`db.get_surf` reads the imported FreeSurfer geometry through `formats.read`, and
-the import path (`cortex/freesurfer.py:490`, `parse_surf`) keeps FreeSurfer's own
-surface RAS without applying `c_ras`. Surface RAS *is* TkRegRAS, so electrode
-coordinates should drop straight onto `fiducial`/`pia` with no transform.
+**Corrected after it cost real data.** This section originally read "TkRegRAS is
+very likely already the surface coordinate system", on the grounds that
+`db.get_surf` reads the imported geometry through `formats.read` and that
+`parse_surf` (`cortex/freesurfer.py:411`) keeps FreeSurfer's surface RAS without
+applying `c_ras`. That is true of `parse_surf` and irrelevant: `parse_surf` is
+the *direct FreeSurfer reader*, not the path that fills the filestore.
 
-Two caveats that must be enforced in code rather than assumed:
+The path that fills the filestore is `import_subj`, and it converts every
+surface with **`mris_convert --to-scanner`** (`cortex/freesurfer.py:243`),
+deliberately, so the surfaces share a frame with the volume data the transform
+machinery works in. `--to-scanner` adds `c_ras`. So a subject imported the
+normal way has **scanner-RAS** surfaces, and TkRegRAS electrode coordinates
+dropped straight onto them land `|c_ras|` away.
+
+Measured on two real subjects in this filestore, both imported by `import_subj`:
+
+| subject | GIFTI dataspace | `c_ras` | error |
+| --- | --- | --- | --- |
+| S0019_complete | 1 (`SCANNER_ANAT`) | (0.98, −4.55, 0.61) | 4.70 mm |
+| TCH06_complete | 1 (`SCANNER_ANAT`) | (1.84, 1.92, −2.03) | 3.35 mm |
+
+Every contact in both montages anchored to the wrong triangle. No hemisphere
+was misassigned and no contact left the brain, which is exactly why it survived
+review: the error moves a contact to the neighbouring gyrus and stops.
+
+The bundled `S1` declares dataspace 0 and was not converted this way, so it
+happens to be exempt — which is worth knowing, because S1 is what the test
+suite runs on and it therefore cannot catch this class of bug at all.
+
+**Nothing geometric detects it.** Both natural checks are blind here, for the
+same reason: cortex folds densely enough that a displaced contact finds another
+bank to sit against. `check_alignment` reported a 0.50 mm systematic shift for
+TCH06's genuinely-3.35 mm-wrong montage, and distance-to-nearest-surface could
+not separate the shifted montage from the correct one either. Only the surface
+file's own provenance — the GIFTI `dataspace` and `VolGeomC_R/A/S` written by
+`mris_convert` — says which space the geometry is in.
+
+`surface_space_offset` (`cortex/electrodes/_set.py`) reads exactly that, and is
+applied at anchor time and when serialising for the viewer. It raises rather
+than guesses when a surface declares scanner space without recording the
+`c_ras` needed to undo it: the alternative is another few silent millimetres.
+
+Three caveats that must be enforced in code rather than assumed:
+
+- **Read the provenance, don't reason about the reader.** The mistake above was
+  reasoning from `parse_surf`'s behaviour to the filestore's contents, with a
+  `mris_convert` call in between. The GIFTI records what was actually run.
 
 - **Verify, don't trust** — but know what verification can reach. `check_alignment`
   reports each electrode's distance to the pial surface and how much of that
@@ -75,6 +116,10 @@ Two caveats that must be enforced in code rather than assumed:
   a contiguous one — judge a montage by its grids, not its outliers — and a montage
   that is mostly sEEG will report a large median offset and read as suspicious when
   it is fine, since depth contacts are legitimately centimetres from the pia.
+  It also excludes rows with no finite coordinate and says how many — a real
+  montage had 14 of 100, and before that they propagated: one NaN row turned
+  every figure in the report into NaN, so the check silently stopped checking
+  on exactly the files most likely to need it.
 - **Never anchor on a nudged surface.** `db.get_surf(..., nudge=True)` shifts
   non-fiducial hemispheres in x (`cortex/database.py:554`). Anchoring happens on
   `pia`/`fiducial` with `nudge=False`; nudging is a display-time concern.
@@ -125,12 +170,15 @@ superficial contacts onto the near bank of a sulcus.
 Store, per electrode, computed once:
 
 ```
-hemi, verts[3], bary_w[3], depth, offset_mm, placement
+hemi, verts[3], bary_w[3], depth, offset_mm, dist_pia_mm, dist_wm_mm, placement
 ```
 
-where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3
-and `offset_mm` is the perpendicular distance from the electrode to the column
-it was assigned to.
+where `depth` is the normalised pia-to-white-matter coordinate defined in 2.3,
+`offset_mm` is the perpendicular distance from the electrode to the column it
+was assigned to, and `dist_pia_mm` / `dist_wm_mm` are the distances to the
+nearest point on each bounding surface — measured against the surfaces
+themselves over the candidate faces, not derived from `depth` and `offset_mm`,
+which would only ever describe this electrode's own column.
 
 **Selection is by distance to the cortical column, not to the mid-surface.**
 The candidate triangles come from the mid-surface, but choosing among them by
@@ -157,6 +205,45 @@ Position on any surface is then `bary_w @ pts[verts]`, needing no polygons at
 all. Barycentric rather than nearest-vertex because contacts are 3-10 mm apart
 while vertices are ~0.5-1 mm apart: nearest-vertex snapping visibly distorts
 within-grid spacing, and barycentric costs three extra floats.
+
+**How far from cortex is too far: 4 mm to the nearest bounding surface.**
+`placement` is `too_far` when an electrode is further than
+`PlacementPolicy.max_surface_distance_mm` from the nearest point on *either*
+bounding surface, pial or white matter. Everything else the policy can bound —
+offset from the assigned column, height above the pia, depth past the white
+matter — is off unless asked for.
+
+This replaced a 10 mm bound on the column offset that was never an anatomical
+number. It came from `check_alignment(threshold_mm=10.0)`, where 10 mm *is*
+calibrated but answers a different question: a correctly placed grid gives a
+1.6 mm median offset and a 15 mm coordinate-space error gives 12.3 mm, so 10 mm
+separates "plausible" from "wrong space". Reused per contact it was a
+registration backstop standing in for a criterion nobody had written.
+
+Measured on S1, distance to the nearer bounding surface:
+
+| contacts | p50 | p90 | max |
+| --- | --- | --- | --- |
+| subdural grid, 1.5 mm above the pia | 1.50 | 1.50 | 1.56 |
+| sEEG shaft, 0–56 mm inward | 0.88 | 1.66 | 2.25 |
+
+The second row is why one number covers both ends of the montage vocabulary,
+and it is not obvious: a shaft driven nearly six centimetres in stays under
+2.3 mm from cortex, because it is threading folds the whole way. So bounding
+*both* directions does not cost the depth electrodes anything. What 4 mm
+excludes is the deep white-matter core, a ventricle, and the outside of the
+head. Pinned by `test_a_resting_grid_and_a_deep_shaft_both_clear_four_millimetres`.
+
+The same folding is why this is **not** a registration check. A contiguous grid
+lifted 15 mm fails every contact; a scattered montage shifted the same 15 mm
+keeps more than half, each stray point finding some bank to land near. That is
+`AlignmentReport`'s caveat restated — judge a montage by its grids, not its
+outliers — and `test_the_rule_catches_a_lifted_grid_but_not_scattered_contacts`
+holds both halves in place.
+
+The threshold is reachable where the decision is visible: `add_electrodes(...,
+max_surface_distance_mm=...)` re-decides it for one figure without touching the
+set's stored `placement`, so a drawing never changes what a later viewer shows.
 
 **`placement` is an explicit enum on every electrode**, never a silent drop:
 `on_surface`, `projected`, `too_far`, `unknown_anatomy`. The design document's
@@ -191,11 +278,22 @@ Three consequences:
 - **An electrode's position tracks `thickmix` for free.** `get_position` already
   interpolates pia-to-wm; the barycentric variant inherits it. The marker moves
   with the surface under both inflation and depth.
-- **Visibility is a function of `|d - thickmix|`.** Fade opacity across a
-  tolerance band rather than switching — a hard cutoff pops as the slider moves,
-  and the fade also communicates *how far* off-depth a contact is. An ECoG grid
-  (`d` near 0) is fully visible in the default view; sliding toward white matter
-  brings the deeper contacts up as the surface ones fade.
+- **Visibility is *not* a function of `|d - thickmix|`** — this was tried and
+  reverted. Making the slider gate visibility means the slider's own default,
+  mid-ribbon, decides what a montage looks like on load, and mid-ribbon is the
+  one depth a subdural contact can never be at. On a real montage it hid 53 of
+  143 placeable contacts, all 35 of the outside-the-pia ones among them,
+  silently. Anchoring the window to the pia instead only moved the problem:
+  it then asks the same question as `PlacementPolicy.max_surface_distance_mm`
+  and answers it more strictly, so a contact that passed the 4 mm projection
+  gate was hidden by a 2 mm window anyway — two gates for one question, and the
+  stricter one invisible and unconfigurable from python.
+
+  So the depth window is **off by default** and the placement policy alone
+  decides what is drawn. The window survives as an exploration control: set it,
+  turn on `depth_follows_slider`, and sweeping the slider walks the montage
+  through the ribbon. That is what it is good for, and it is opt-in because
+  wanting it is a deliberate act rather than the common case.
 - **The common ECoG case lands correctly with no special-casing.** Grid and strip
   contacts sit slightly *above* pia (dura, contact thickness), giving small
   negative `d`, which clamps to 0 and shows in the default view.

@@ -49,10 +49,32 @@ var electrodes = (function(module) {
         this.subject = json.subject === undefined ? "" : json.subject;
         this.nelec = json.nelec === undefined ? null : json.nelec;
         this._raw = new THREE.Vector3();   // scratch, reused every frame
-        // How far, in millimetres, a contact may sit from the depth currently
-        // being sampled and still be drawn on a deformed surface. Null shows
-        // everything.
-        this.depthWindow = json.depth_window === undefined ? 2.0 : json.depth_window;
+        // How far, in millimetres, a contact may sit from the reference depth
+        // and still be drawn on a deformed surface. Null -- the default --
+        // shows everything.
+        //
+        // Off by default because with the window measured from the pia (see
+        // `depthFollowsSlider`) it asks the same question as the placement
+        // policy's `max_surface_distance_mm`, and asked it more strictly: a
+        // contact that passed the 4 mm projection gate was then hidden by a
+        // 2 mm window, with nothing said about it. One gate decides what has an
+        // honest position, and it is the one that is configurable in python and
+        // reports what it excluded. This is left for what it is good for --
+        // sweeping through the ribbon, with `depth_follows_slider` on.
+        this.depthWindow = json.depth_window === undefined ? null : json.depth_window;
+        // Which depth that window is measured from. The pia by default, rather
+        // than whatever the surface's `thickmix` slider is sampling.
+        //
+        // The slider defaults to mid-ribbon, which is a sensible place to
+        // *render* a surface and a bad place to look for electrodes: a subdural
+        // contact sits above the pia by construction and can never be near the
+        // middle of the ribbon. Measured on a real montage, following the
+        // slider hid 53 of 143 placeable contacts on load -- including every
+        // one of the 35 sitting outside the pia -- with nothing to say they
+        // were missing. Anchoring the window to the pia shows the montage as
+        // implanted, and `depth_follows_slider` gets the old behaviour for
+        // anyone reading depth off the slider deliberately.
+        this.depthFollowsSlider = json.depth_follows_slider === true;
         this._visible = true;
 
         this.markers = {left:new THREE.Group(), right:new THREE.Group()};
@@ -145,6 +167,7 @@ var electrodes = (function(module) {
             labels:  {action:[this, "setLabels"]},
             connections: {action:[this, "setConnections"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
+            depth_follows_slider: {action:[this, "setDepthFollowsSlider"]},
             shape: {action:[this, "setShape", ["auto", "sphere", "cube", "diamond"]]},
         });
         if (this._filterFields.length)
@@ -218,16 +241,29 @@ var electrodes = (function(module) {
             return true;
         if (contact.depth_mm === null || contact.thickness === null)
             return true;
-        var sampled = thickmix * contact.thickness;     // mm from the pia
+        // mm from the pia. Zero unless the caller asked the window to ride the
+        // surface's depth slider -- see `depthFollowsSlider`.
+        var sampled = this.depthFollowsSlider ? thickmix * contact.thickness : 0;
         return Math.abs(contact.depth_mm - sampled) <= this.depthWindow;
     };
 
     module.Electrodes.prototype.setDepthWindow = function(val) {
+        // Report "off" as the top of the range rather than as null, so the
+        // slider has a number to sit on and starts where the behaviour is.
         if (val === undefined)
-            return this.depthWindow;
+            return this.depthWindow === null ? 20 : this.depthWindow;
         // The top of the slider means "no filtering" rather than a 20 mm window,
         // which would be an arbitrary number pretending to be a limit.
         this.depthWindow = val >= 20 ? null : val;
+        this._refresh();
+    };
+
+    // Measure the depth window from the surface's depth slider instead of from
+    // the pia. Off by default; see `depthFollowsSlider` for why.
+    module.Electrodes.prototype.setDepthFollowsSlider = function(val) {
+        if (val === undefined)
+            return this.depthFollowsSlider;
+        this.depthFollowsSlider = !!val;
         this._refresh();
     };
 

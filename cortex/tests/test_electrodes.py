@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from cortex.electrodes import (
+    surface_space_offset,
     ON_SURFACE,
     ElectrodeInfo,
     ElectrodeSet,
@@ -296,8 +297,36 @@ def test_json_round_trip_keeps_the_anchors(eset, hemis, tmp_path):
     assert np.allclose(back.anchors.weights, eset.anchors.weights)
     assert np.allclose(back.anchors.depth, eset.anchors.depth)
     assert list(back.anchors.placement) == list(eset.anchors.placement)
+    assert np.allclose(back.anchors.dist_pia_mm, eset.anchors.dist_pia_mm)
+    assert np.allclose(back.anchors.dist_wm_mm, eset.anchors.dist_wm_mm)
     assert back.anchors.surface_hash == eset.anchors.surface_hash
     assert back.subject == "TEST"
+
+
+def test_a_file_without_surface_distances_gets_a_usable_fallback(eset, hemis, tmp_path):
+    """Files written before the surface-distance rule carry no such field.
+
+    Leaving them NaN would make ``reclassify()`` on an old file accept every
+    contact, however far from cortex, and say nothing about it. The distance to
+    the contact's own column is the honest reconstruction: an upper bound on
+    the real one, since it cannot see a nearer sulcal bank.
+    """
+    import json
+
+    eset.anchor(surfaces=hemis)
+    path = tmp_path / "e.json"
+    save_electrodes_json(eset, path)
+    payload = json.loads(path.read_text())
+    del payload["anchors"]["dist_pia_mm"], payload["anchors"]["dist_wm_mm"]
+    path.write_text(json.dumps(payload))
+
+    back = load_electrodes_json(path)
+    assert np.isfinite(back.anchors.surface_distance_mm).all()
+    # The fixture's contacts sit 1 mm above a 3 mm ribbon, straight over their
+    # own columns, so the reconstruction is exact there.
+    assert np.allclose(back.anchors.dist_pia_mm, 1.0, atol=1e-6)
+    assert np.allclose(back.anchors.dist_wm_mm, 4.0, atol=1e-6)
+    assert back.anchors.surface_distance_mm.max() >= back.anchors.dist_pia_mm.max()
 
 
 def test_json_round_trip_without_anchors(eset, tmp_path):
@@ -342,3 +371,90 @@ def test_the_stated_hemisphere_does_not_override_the_geometry(eset, hemis):
     eset.anchor(surfaces=hemis)
     assert list(eset.anchors.hemi) == ["lh", "lh", "lh", "rh", "rh"]
     assert eset.anchors.placement[0] == "projected"
+
+
+# -- the space the surfaces are stored in -----------------------------------
+
+def _write_gii(path, pts, polys, dataspace, c_ras=None):
+    """A minimal surface file with the provenance `surface_space_offset` reads."""
+    import nibabel as nib
+    from nibabel import gifti
+
+    pts_d = gifti.GiftiDataArray(np.asarray(pts, np.float32), "pointset")
+    pts_d.coordsys = gifti.GiftiCoordSystem(dataspace=dataspace, xformspace=0)
+    meta = {"AnatomicalStructurePrimary": "CortexLeft"}
+    if c_ras is not None:
+        meta.update({"VolGeomC_" + a: str(v) for a, v in zip("RAS", c_ras)})
+    pts_d.meta = gifti.GiftiMetaData(meta)
+    polys_d = gifti.GiftiDataArray(np.asarray(polys, np.int32), "triangle")
+    nib.save(gifti.GiftiImage(darrays=[pts_d, polys_d]), str(path))
+    return path
+
+
+@pytest.fixture
+def fake_surf(monkeypatch, tmp_path):
+    """Point the database's surface paths at a file this test wrote."""
+    import cortex.database
+
+    def install(dataspace, c_ras=None, suffix=".gii"):
+        path = tmp_path / ("pia_lh" + suffix)
+        if suffix == ".gii":
+            _write_gii(path, np.zeros((3, 3)), [[0, 1, 2]], dataspace, c_ras)
+        else:
+            path.write_text("not a gifti")
+
+        class FakeDB:
+            def get_paths(self, subject):
+                return {"surfs": {"pia": {"lh": str(path)}}}
+
+        # `surface_space_offset` imports `db` from the module inside the call,
+        # so the module attribute is what has to be replaced.
+        monkeypatch.setattr(cortex.database, "db", FakeDB())
+        return path
+
+    return install
+
+
+def test_scanner_space_surfaces_report_their_c_ras(fake_surf):
+    """A subject imported with `mris_convert --to-scanner` needs the shift.
+
+    This is the failure that prompted the function: TkRegRAS electrodes on
+    scanner-RAS surfaces land |c_ras| away -- a few millimetres, enough to move
+    a contact to the next gyrus and not enough to look wrong.
+    """
+    fake_surf(dataspace=1, c_ras=(0.983536, -4.552475, 0.609024))
+    offset = surface_space_offset("SUBJ")
+    assert np.allclose(offset, [0.983536, -4.552475, 0.609024])
+
+
+def test_tkreg_surfaces_need_no_shift(fake_surf):
+    fake_surf(dataspace=0, c_ras=(9.0, 9.0, 9.0))
+    assert np.allclose(surface_space_offset("SUBJ"), 0.0)
+
+
+def test_scanner_space_without_a_c_ras_is_refused(fake_surf):
+    """Loudly, rather than by a few silent millimetres."""
+    fake_surf(dataspace=1, c_ras=None)
+    with pytest.raises(ValueError, match="VolGeomC"):
+        surface_space_offset("SUBJ")
+
+
+def test_a_non_gifti_surface_means_another_import_route(fake_surf):
+    fake_surf(dataspace=1, suffix=".npz")
+    assert np.allclose(surface_space_offset("SUBJ"), 0.0)
+
+
+def test_passing_surfaces_directly_applies_no_offset(eset, hemis, monkeypatch):
+    """Surfaces handed in are taken at face value -- the caller owns the frame.
+
+    Anchoring against them must not consult the database for a subject whose
+    surfaces are not the ones being used.
+    """
+    from cortex.electrodes import _set
+
+    def explode(subject):
+        raise AssertionError("surface_space_offset called for passed-in surfaces")
+
+    monkeypatch.setattr(_set, "surface_space_offset", explode)
+    anchors = eset.anchor(surfaces=hemis)
+    assert anchors.placement[0] == "projected"
