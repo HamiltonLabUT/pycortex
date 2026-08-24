@@ -59,6 +59,7 @@ from ._io import (
     to_dict,
     write_electrodes_tsv,
 )
+from ._connect import GRID_SLACK, LINEAR_TYPES, group_edges
 from ._webgl import to_viewer_json
 from ._set import (
     GROUP_TYPES,
@@ -99,6 +100,10 @@ __all__ = [
     "AlignmentReport",
     "check_alignment",
     "check_hemispheres",
+    # which contacts are neighbours on their device
+    "group_edges",
+    "LINEAR_TYPES",
+    "GRID_SLACK",
     # io
     "to_viewer_json",
     "load_electrodes",

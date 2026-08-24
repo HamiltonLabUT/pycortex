@@ -60,6 +60,19 @@ def build_grid(subject=SUBJECT, n=8, pitch=PITCH):
     return eset
 
 
+def _unwrap_list(value):
+    """Peel the python bridge's wrapping off a list it returned.
+
+    Every value comes back inside a one-element list, and an array comes back
+    with that wrapping nested. A genuine one-element result survives, because
+    peeling stops as soon as the single element is not itself a list.
+    """
+    while (isinstance(value, list) and len(value) == 1
+           and isinstance(value[0], list)):
+        value = value[0]
+    return value
+
+
 def row_spacing(positions, n=8):
     """Distances between neighbouring contacts along each row of the grid."""
     positions = np.asarray(positions)
@@ -264,6 +277,48 @@ class TestMarkersInTheViewer:
         time.sleep(0.5)
         # ...and pointing at empty space clears it.
         assert unwrap(e.hoverAt(-0.98, -0.98)) == ""
+
+    def test_contacts_on_the_same_device_are_joined_by_a_line(self):
+        """The lattice, drawn.
+
+        An 8x8 grid has 2*8*7 edge neighbours, and a wrong lattice does not hit
+        that number by accident: too many means the diagonals crept in and the
+        grid reads as a sheet of triangles, too few means it was torn where the
+        cortex stretched it.
+        """
+        e = type(self).handle.surfs[0].surf.electrodes
+        edges = _unwrap_list(e.describeEdges())
+        assert len(edges) == 2 * 8 * 7
+
+        names = {c["name"] for c in type(self).reported}
+        assert all(edge["a"] in names and edge["b"] in names for edge in edges)
+        assert all(edge["a"] != edge["b"] for edge in edges)
+
+    def test_the_lines_join_contacts_that_are_actually_adjacent(self):
+        """Not contacts on opposite sides of the grid.
+
+        Same regression as the markers themselves: the edges are indices into
+        the contact list, so an off-by-one anywhere between python and here
+        draws a neat mesh over the wrong pairs. A segment has to be about as
+        long as the within-row spacing measured independently.
+        """
+        e = type(self).handle.surfs[0].surf.electrodes
+        drawn = np.array([edge["length"] for edge in _unwrap_list(e.describeEdges())])
+        expected = type(self).expected
+        assert np.median(drawn) == pytest.approx(np.median(expected), abs=1.0)
+        # A diagonal would be sqrt(2) spacings long, and a wild pair much more.
+        assert drawn.max() < 3 * np.median(expected)
+
+    def test_the_connection_lines_toggle(self):
+        """On by default: which device a contact belongs to is the first thing
+        a montage has to say, so it should not need turning on."""
+        e = type(self).handle.surfs[0].surf.electrodes
+        assert e.setConnections() in (True, [True])
+        e.setConnections(False)
+        time.sleep(1)
+        assert e.setConnections() in (False, [False])
+        e.setConnections(True)
+        time.sleep(0.5)
 
     def test_filters_compose_and_clear(self):
         """Each filter is one criterion and a contact has to pass all of them."""
@@ -474,9 +529,21 @@ class TestMarkerColoursFollowTheData:
             dtype=int,
         )
         sat = img.max(2) - img.min(2)
-        # The cortex is the large mid-grey region; markers are a few hundred px.
+        # The cortex is the large mid-grey region; the coloured things on top of
+        # it are the markers and the lines joining them.
         greyish = ((sat <= 40) & (img.mean(2) > 40) & (img.mean(2) < 220)).sum()
-        assert greyish > 20 * (sat > 40).sum(), "the cortex looks coloured, not grey"
+        coloured = (sat > 40).sum()
+        # A ratio rather than a pixel count, because the claim is "the cortex is
+        # grey" and the brain's size on screen depends on the camera.
+        #
+        # The allowance was 20x when this was written, when markers were the only
+        # coloured thing. Connection lines are a second one, drawn in the marker
+        # colour: measured on this view the ratio is 22.7 with the lines off and
+        # 15.0 with them on, while the grey count barely moves (36529 vs 35776).
+        # So the surface is not what changed. 5x keeps the failure this test is
+        # for -- a data layer leaking onto the cortex would not shade this
+        # number, it would invert it, colouring most of what is counted as grey.
+        assert greyish > 5 * coloured, "the cortex looks coloured, not grey"
 
     def test_scrubbing_the_movie_recolours_the_markers(self):
         cls = type(self)
