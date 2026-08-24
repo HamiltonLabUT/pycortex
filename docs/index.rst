@@ -24,6 +24,7 @@ User Guide
    .. dataset
    rois
    roidraw
+   electrodes
    transforms
    colormaps
 
