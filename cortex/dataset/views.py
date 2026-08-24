@@ -957,7 +957,11 @@ class ScalarView(Packable, RenderableView):
             a,
             description=self.description,
             state=self.state,
-            priority=self.priority,
+            # `attrs` rather than `priority=`, which is one of its keys: forwarding
+            # the whole mapping is a strict generalisation, and the alternative is
+            # to name every future attrs-backed parameter here as it is added.
+            # Without it a raw view silently loses metadata the original carried.
+            attrs=self.attrs,
         )
         result._nan_mask = nan_mask
         return result

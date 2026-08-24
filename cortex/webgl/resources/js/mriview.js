@@ -1386,6 +1386,7 @@ var mriview = (function(module) {
                     $(this.object).find("#vmin").val(ui.values[0]);
                     $(this.object).find("#vmax").val(ui.values[1]);
                     this.active.setVminmax(ui.values[0], ui.values[1]);
+                    this._refreshElectrodes();
                     this.schedule();
                 }.bind(this)
             });

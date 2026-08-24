@@ -587,3 +587,24 @@ button#twodbutton:disabled, button#twodbutton[disabled] {
     color: #888;
     opacity: 0.5;
 }
+
+/* Metadata for the clicked electrode. Bottom left, clear of the colour legend
+   and the dataset list. */
+#electrode_info {
+    display: none;
+    position: absolute;
+    z-index: 1000;
+    left: 12px;
+    bottom: 12px;
+    min-width: 170px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background: rgba(20, 20, 20, 0.82);
+    color: #eee;
+    font-family: sans-serif;
+    font-size: 12px;
+    line-height: 1.5;
+}
+#electrode_info .erow { white-space: nowrap; }
+#electrode_info .ekey { display: inline-block; width: 88px; color: #9ab; }
+#electrode_info .eval { color: #fff; }
