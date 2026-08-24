@@ -758,6 +758,12 @@ class AlignmentReport:
         default_factory=lambda: np.zeros(3)
     )
     n_electrodes: int = 0
+    n_skipped: int = 0
+    """Rows with a non-finite coordinate, which were left out of every figure
+    above. Real montages carry these in quantity -- placeholder rows for
+    unconnected amplifier channels -- and one of them is enough to turn an
+    unguarded median into NaN, so they are excluded and counted rather than
+    propagated."""
     suspicious: bool = False
 
     @property
@@ -778,6 +784,11 @@ class AlignmentReport:
             "  systematic shift  (%.2f, %.2f, %.2f) mm, |%.2f|"
             % (*self.systematic_shift_mm, self.shift_magnitude_mm),
         ]
+        if self.n_skipped:
+            lines.append(
+                "  %d row%s skipped for having no finite coordinate"
+                % (self.n_skipped, "" if self.n_skipped == 1 else "s")
+            )
         if self.suspicious:
             lines.append(
                 "  SUSPICIOUS: electrodes sit this far off the surface only when "
@@ -799,16 +810,32 @@ def check_alignment(
     particular that it is blind to a shift along the cortical sheet.
     """
     coords = np.atleast_2d(np.asarray(coords, dtype=np.float64))
+
+    # Placeholder rows for unconnected amplifier channels carry NaN
+    # coordinates. `anchor_to_surfaces` keeps them, correctly -- their row
+    # indices still line up with data recorded on those channels -- but their
+    # positions come back NaN, and a single one of those turns every statistic
+    # below into NaN. A report that says nothing at all is worse than one that
+    # says what it measured and how much it left out.
+    finite = np.isfinite(coords).all(axis=1)
+    if not finite.any():
+        raise ValueError(
+            "no electrode has a finite coordinate, so there is nothing to "
+            "check alignment against"
+        )
+    measured = coords[finite]
+
     anchors = anchor_to_surfaces(
-        coords, hemis,
+        measured, hemis,
         policy=PlacementPolicy(max_surface_distance_mm=np.inf),
     )
-    residuals = coords - anchors.evaluate({h: hemis[h].pia for h in hemis})
+    residuals = measured - anchors.evaluate({h: hemis[h].pia for h in hemis})
     offsets = np.linalg.norm(residuals, axis=1)
     return AlignmentReport(
         median_offset_mm=float(np.median(offsets)),
         max_offset_mm=float(np.max(offsets)),
         systematic_shift_mm=residuals.mean(0),
-        n_electrodes=len(coords),
+        n_electrodes=int(finite.sum()),
+        n_skipped=int((~finite).sum()),
         suspicious=bool(np.median(offsets) > threshold_mm),
     )

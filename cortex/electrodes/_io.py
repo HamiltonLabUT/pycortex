@@ -316,8 +316,17 @@ def read_elecs_mat(
     on. Three arrays, of which only the first is required:
 
     ``elecmatrix``
-        ``(n, 3)`` coordinates in FreeSurfer surface RAS -- the same space
-        pycortex holds its surfaces in, so no transform is needed.
+        ``(n, 3)`` coordinates in FreeSurfer surface RAS, better known as
+        TkRegRAS. Stored verbatim: this is the montage's own coordinate and the
+        set keeps it unaltered.
+
+        It is *not* necessarily the space pycortex holds its surfaces in.
+        :func:`cortex.freesurfer.import_subj` converts them with
+        ``mris_convert --to-scanner``, which adds ``c_ras`` -- three to five
+        millimetres on a typical scan. :func:`~cortex.electrodes.surface_space_offset`
+        reads which space a subject's surfaces are in and anchoring applies the
+        difference, so nothing here needs adjusting; but a caller comparing
+        these coordinates against surface vertices by hand does.
     ``eleclabels``
         ``(n, 3)`` cell array: short channel name, long channel name, device
         type (``grid``, ``strip``, ``depth``).

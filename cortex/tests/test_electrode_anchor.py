@@ -367,6 +367,44 @@ def test_a_uniform_shift_is_caught(hemis):
     assert np.isclose(report.shift_magnitude_mm, 50.0, atol=1.0)
 
 
+def test_placeholder_rows_are_excluded_rather_than_propagated(hemis):
+    """One NaN row used to turn every statistic in the report into NaN.
+
+    Real montages carry these in quantity -- placeholder rows for unconnected
+    amplifier channels -- so a report that cannot survive one is a report that
+    says nothing about most real files. Measured on a clinical montage: 14 of
+    100 rows, and the whole summary came back NaN.
+    """
+    coords = np.array([
+        [-20.0, 0.0, 1.0],
+        [np.nan, np.nan, np.nan],
+        [-22.0, 2.0, 1.5],
+        [20.0, -4.0, np.nan],
+    ])
+    report = check_alignment(coords, hemis)
+    assert np.isfinite(report.median_offset_mm)
+    assert np.isfinite(report.systematic_shift_mm).all()
+    assert report.n_electrodes == 2 and report.n_skipped == 2
+    assert "2 rows skipped" in report.summary()
+
+
+def test_a_single_skipped_row_reads_as_singular(hemis):
+    coords = np.array([[-20.0, 0.0, 1.0], [np.nan, 0.0, 0.0]])
+    assert "1 row skipped" in check_alignment(coords, hemis).summary()
+
+
+def test_a_montage_with_no_finite_coordinate_is_refused(hemis):
+    """Nothing was measured, so there is no report to make."""
+    with pytest.raises(ValueError, match="finite coordinate"):
+        check_alignment(np.full((3, 3), np.nan), hemis)
+
+
+def test_a_clean_montage_reports_nothing_skipped(hemis):
+    report = check_alignment(np.array([[-20.0, 0.0, 1.0]]), hemis)
+    assert report.n_skipped == 0
+    assert "skipped" not in report.summary()
+
+
 def test_the_surface_hash_tracks_the_surfaces(hemis):
     before = surface_hash(hemis)
     assert before == surface_hash(hemis)

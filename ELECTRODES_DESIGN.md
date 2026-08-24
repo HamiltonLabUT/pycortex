@@ -53,14 +53,55 @@ is drawn with that extent. So an electrode's flat position — read straight out
 `add_rois`, roughly forty lines, with no new cache and no change to
 `make_flatmap_image`.
 
-### 1.4 TkRegRAS is very likely already the surface coordinate system
+### 1.4 TkRegRAS is *not* the surface coordinate system — this was wrong
 
-`db.get_surf` reads the imported FreeSurfer geometry through `formats.read`, and
-the import path (`cortex/freesurfer.py:490`, `parse_surf`) keeps FreeSurfer's own
-surface RAS without applying `c_ras`. Surface RAS *is* TkRegRAS, so electrode
-coordinates should drop straight onto `fiducial`/`pia` with no transform.
+**Corrected after it cost real data.** This section originally read "TkRegRAS is
+very likely already the surface coordinate system", on the grounds that
+`db.get_surf` reads the imported geometry through `formats.read` and that
+`parse_surf` (`cortex/freesurfer.py:411`) keeps FreeSurfer's surface RAS without
+applying `c_ras`. That is true of `parse_surf` and irrelevant: `parse_surf` is
+the *direct FreeSurfer reader*, not the path that fills the filestore.
 
-Two caveats that must be enforced in code rather than assumed:
+The path that fills the filestore is `import_subj`, and it converts every
+surface with **`mris_convert --to-scanner`** (`cortex/freesurfer.py:243`),
+deliberately, so the surfaces share a frame with the volume data the transform
+machinery works in. `--to-scanner` adds `c_ras`. So a subject imported the
+normal way has **scanner-RAS** surfaces, and TkRegRAS electrode coordinates
+dropped straight onto them land `|c_ras|` away.
+
+Measured on two real subjects in this filestore, both imported by `import_subj`:
+
+| subject | GIFTI dataspace | `c_ras` | error |
+| --- | --- | --- | --- |
+| S0019_complete | 1 (`SCANNER_ANAT`) | (0.98, −4.55, 0.61) | 4.70 mm |
+| TCH06_complete | 1 (`SCANNER_ANAT`) | (1.84, 1.92, −2.03) | 3.35 mm |
+
+Every contact in both montages anchored to the wrong triangle. No hemisphere
+was misassigned and no contact left the brain, which is exactly why it survived
+review: the error moves a contact to the neighbouring gyrus and stops.
+
+The bundled `S1` declares dataspace 0 and was not converted this way, so it
+happens to be exempt — which is worth knowing, because S1 is what the test
+suite runs on and it therefore cannot catch this class of bug at all.
+
+**Nothing geometric detects it.** Both natural checks are blind here, for the
+same reason: cortex folds densely enough that a displaced contact finds another
+bank to sit against. `check_alignment` reported a 0.50 mm systematic shift for
+TCH06's genuinely-3.35 mm-wrong montage, and distance-to-nearest-surface could
+not separate the shifted montage from the correct one either. Only the surface
+file's own provenance — the GIFTI `dataspace` and `VolGeomC_R/A/S` written by
+`mris_convert` — says which space the geometry is in.
+
+`surface_space_offset` (`cortex/electrodes/_set.py`) reads exactly that, and is
+applied at anchor time and when serialising for the viewer. It raises rather
+than guesses when a surface declares scanner space without recording the
+`c_ras` needed to undo it: the alternative is another few silent millimetres.
+
+Three caveats that must be enforced in code rather than assumed:
+
+- **Read the provenance, don't reason about the reader.** The mistake above was
+  reasoning from `parse_surf`'s behaviour to the filestore's contents, with a
+  `mris_convert` call in between. The GIFTI records what was actually run.
 
 - **Verify, don't trust** — but know what verification can reach. `check_alignment`
   reports each electrode's distance to the pial surface and how much of that
@@ -75,6 +116,10 @@ Two caveats that must be enforced in code rather than assumed:
   a contiguous one — judge a montage by its grids, not its outliers — and a montage
   that is mostly sEEG will report a large median offset and read as suspicious when
   it is fine, since depth contacts are legitimately centimetres from the pia.
+  It also excludes rows with no finite coordinate and says how many — a real
+  montage had 14 of 100, and before that they propagated: one NaN row turned
+  every figure in the report into NaN, so the check silently stopped checking
+  on exactly the files most likely to need it.
 - **Never anchor on a nudged surface.** `db.get_surf(..., nudge=True)` shifts
   non-fiducial hemispheres in x (`cortex/database.py:554`). Anchoring happens on
   `pia`/`fiducial` with `nudge=False`; nudging is a display-time concern.
