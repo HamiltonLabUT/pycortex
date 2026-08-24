@@ -180,13 +180,19 @@ class TestMarkersInTheViewer:
     def test_at_unfold_zero_markers_sit_at_their_true_coordinates(self):
         """On the anatomical surface the measured coordinate is the truth.
 
-        A depth contact belongs inside the brain; snapping it to the nearest
-        gyrus would draw a position it does not have. The anchor only takes
-        over once the surface deforms and the coordinate stops meaning
-        anything.
+        Markers are drawn exactly there and never stood off, so a depth
+        contact is inside the brain because that is where it is. Turn
+        `surface_opacity` down to see those; do not move the marker.
         """
-        drawn = np.array([c["position"] for c in type(self).reported])
+        drawn = np.array([c["position"] for c in self._describe()])
         assert np.allclose(drawn, type(self).eset.coords, atol=1e-3)
+
+    def _describe(self):
+        reported = type(self).handle.surfs[0].surf.electrodes.describe()
+        while (isinstance(reported, list) and len(reported) == 1
+               and isinstance(reported[0], list)):
+            reported = reported[0]
+        return reported
 
     def test_the_depth_window_follows_the_sampled_surface(self):
         """A deformed surface shows one depth through the ribbon at a time.
@@ -258,6 +264,75 @@ class TestMarkersInTheViewer:
         time.sleep(0.5)
         # ...and pointing at empty space clears it.
         assert unwrap(e.hoverAt(-0.98, -0.98)) == ""
+
+    def test_filters_compose_and_clear(self):
+        """Each filter is one criterion and a contact has to pass all of them."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        everything = U(e.countVisible())
+        assert everything > 0
+
+        e.filter_group_type("grid")
+        time.sleep(0.5)
+        grids = U(e.countVisible())
+        assert 0 < grids <= everything
+
+        e.filter_group_type("all")
+        time.sleep(0.5)
+        assert U(e.countVisible()) == everything
+
+    def test_shape_control(self):
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        e.setShape("cube")
+        time.sleep(0.5)
+        assert U(e.setShape()) == "cube"
+        e.setShape("sphere")
+        time.sleep(0.5)
+
+    def test_marker_radius_comes_from_the_recorded_diameter(self):
+        """Half the contact's own diameter, or the fallback where the montage
+        records none. No global radius control: the montage already knows how
+        big its electrodes are."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        eset = type(self).eset
+        for i in range(min(4, len(eset))):
+            expected = (eset.size[i] / 2 if np.isfinite(eset.size[i])
+                        else U(e.radius))
+            assert U(e.contacts[i].radius) == pytest.approx(expected)
+
+    def test_clicking_a_contact_opens_the_metadata_panel(self):
+        """Driven through the real hit test, by projecting a contact to screen
+        coordinates rather than poking the selection in directly."""
+        e = type(self).handle.surfs[0].surf.electrodes
+
+        def U(v):
+            while isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            return v
+
+        xy = U(e.projectContact(0))
+        name = U(e.selectAt(xy[0], xy[1]))
+        assert name, "clicking a projected contact selected nothing"
+        assert U(e.selected()) == name
+        # ...and clicking empty space clears it
+        assert U(e.selectAt(-0.98, -0.98)) == ""
 
     def test_the_page_raises_no_errors(self):
         errors = [e for e in type(self).handle._pw_thread.browser_errors
@@ -495,3 +570,143 @@ def test_a_dataset_over_two_montages_refuses_to_guess(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="different montages"):
         _electrodes_from(both, None)
+
+
+# -- per-view marker vectors ------------------------------------------------
+
+def _unwrap(value):
+    while isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value
+
+
+def test_each_contact_carries_its_montage_index():
+    """The payload drops unplaceable contacts, so a contact's position in the
+    list is not its position in the montage. A view's marker arrays are
+    montage-length, so the index is what makes them readable at all."""
+    from cortex.electrodes import to_viewer_json
+
+    eset = build_grid()
+    eset.anchor()
+    payload = to_viewer_json(eset)
+
+    assert payload["nelec"] == len(eset)
+    assert [c["index"] for c in payload["electrodes"]] == list(
+        np.flatnonzero(eset.anchors.placeable)
+    )
+
+
+@pytest.mark.skipif(not has_playwright, reason="playwright and chromium are required")
+class TestPerViewMarkers:
+    """A view whose marker vectors override the montage's own diameters."""
+
+    SIZES = [1.0, 2.0, 4.0, np.nan, 8.0, 10.0]
+    SHAPES = ["sphere", "cube", "diamond", "cube", "sphere", "diamond"]
+    MONTAGE_DIAMETER = 3.0
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _viewer(self, request, tmp_path_factory):
+        import shutil
+
+        from cortex.electrodes import ElectrodeSet, load_surface_pairs
+
+        cls = request.cls
+        pair = load_surface_pairs(SUBJECT)["lh"]
+        pia = pair.pia.astype(np.float64)
+        n = len(cls.SIZES)
+        eset = ElectrodeSet(
+            ["E%d" % (i + 1) for i in range(n)],
+            pia[np.arange(n) * 500 + 40000],
+            subject=SUBJECT, group_type=["grid"] * n,
+            size=[cls.MONTAGE_DIAMETER] * n,
+        )
+        eset.anchor()
+
+        store = str(tmp_path_factory.mktemp("markerstore"))
+        shutil.copytree(os.path.join(cortex.db.filestore, SUBJECT),
+                        os.path.join(store, SUBJECT))
+        old = cortex.db.filestore
+        cortex.db.filestore = store
+        cortex.db.reload_subjects()
+        cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+
+        view = cortex.Electrode(np.arange(float(n)), SUBJECT, "native",
+                                marker_size=cls.SIZES, marker_shape=cls.SHAPES)
+        cls.plain = cortex.electrodes.blank(SUBJECT) if hasattr(
+            cortex.electrodes, "blank") else cortex.Vertex.random(SUBJECT)
+
+        with cortex.export.headless_viewer(view, viewer_params={}) as handle:
+            time.sleep(4)
+            cls.handle = handle
+            yield
+
+        cortex.db.filestore = old
+        cortex.db.reload_subjects()
+
+    def _described(self):
+        return _unwrap(type(self).handle.surfs[0].surf.electrodes.describe())
+
+    def test_marker_size_overrides_the_montage_diameter(self):
+        """...and a NaN entry means "not this one", falling back to the montage
+        rather than to zero."""
+        radii = [c["radius"] for c in self._described()]
+        expected = [
+            type(self).MONTAGE_DIAMETER / 2 if np.isnan(s) else s / 2
+            for s in type(self).SIZES
+        ]
+        assert radii == pytest.approx(expected)
+
+    def test_marker_shape_is_per_contact(self):
+        assert [c["shape"] for c in self._described()] == type(self).SHAPES
+
+    def test_the_shape_menu_overrides_and_auto_gives_the_view_back(self):
+        e = type(self).handle.surfs[0].surf.electrodes
+        e.setShape("cube")
+        time.sleep(0.7)
+        assert {c["shape"] for c in self._described()} == {"cube"}
+
+        e.setShape("auto")
+        time.sleep(0.7)
+        assert [c["shape"] for c in self._described()] == type(self).SHAPES
+
+    def test_the_page_raises_no_errors(self):
+        errors = [e for e in type(self).handle._pw_thread.browser_errors
+                  if "[pageerror]" in e]
+        assert errors == [], "JS errors: %s" % errors
+
+
+@pytest.mark.skipif(not has_playwright, reason="playwright and chromium are required")
+def test_the_shape_vocabulary_matches_the_viewer(tmp_path_factory):
+    """Python names the shapes and the viewer builds them; nothing links the two
+    but this test. Drive every name and check the viewer accepts it."""
+    import shutil
+
+    from cortex.dataset.electrode_views import MARKER_SHAPES
+    from cortex.electrodes import ElectrodeSet, load_surface_pairs
+
+    pair = load_surface_pairs(SUBJECT)["lh"]
+    pia = pair.pia.astype(np.float64)
+    eset = ElectrodeSet(["E1", "E2"], pia[[40000, 40500]], subject=SUBJECT,
+                        group_type=["grid"] * 2)
+    eset.anchor()
+
+    store = str(tmp_path_factory.mktemp("vocabstore"))
+    shutil.copytree(os.path.join(cortex.db.filestore, SUBJECT),
+                    os.path.join(store, SUBJECT))
+    old = cortex.db.filestore
+    cortex.db.filestore = store
+    cortex.db.reload_subjects()
+    cortex.db.save_montage(SUBJECT, eset, "native", overwrite=True)
+    try:
+        view = cortex.Electrode(np.zeros(2), SUBJECT, "native")
+        with cortex.export.headless_viewer(view, viewer_params={}) as handle:
+            time.sleep(4)
+            e = handle.surfs[0].surf.electrodes
+            for name in MARKER_SHAPES:
+                e.setShape(name)
+                time.sleep(0.6)
+                drawn = {c["shape"] for c in _unwrap(e.describe())}
+                assert drawn == {name}, "viewer would not draw %r" % name
+    finally:
+        cortex.db.filestore = old
+        cortex.db.reload_subjects()

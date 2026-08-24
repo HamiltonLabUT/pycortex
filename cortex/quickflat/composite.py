@@ -695,6 +695,11 @@ MARKER_BY_GROUP_TYPE = {
 
 DEFAULT_MARKER = "o"
 
+#: The viewer's shape vocabulary in matplotlib's spelling, so a view's
+#: `marker_shape` means the same thing in a figure as in the browser. The keys
+#: must cover `cortex.dataset.electrode_views.MARKER_SHAPES`.
+MARKER_BY_SHAPE = {"sphere": "o", "cube": "s", "diamond": "D"}
+
 
 def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
                    values: Optional[npt.ArrayLike]=None,
@@ -808,10 +813,14 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
     # the same behaviour, and an explicit argument still wins -- passing
     # `cmap=` alongside a view overrides the view's, which is what someone
     # reaching for the override expects.
+    view_size = view_shape = None
     if isinstance(electrodes, ElectrodeView):
         view = electrodes
         electrodes = view.electrodes
         subject = view.subject if subject is None else subject
+        # Read for every column, not just the scalar one: a 2D or RGB view
+        # carries marker vectors exactly the same way.
+        view_size, view_shape = view.marker_size, view.marker_shape
         if isinstance(view, Electrode):
             if values is None:
                 values = view.data[0] if view.movie else view.data
@@ -869,6 +878,12 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
     # `select` rather than `electrodes[keep]`: indexing is overloaded to return a
     # single ElectrodeInfo for a scalar index, so only this spelling is a set.
     selected = electrodes.select(where=keep)
+    # The marker vectors are montage-length, like `values_arr`, so they take the
+    # same mask -- `keep` folds in both the placement policy and the depth band.
+    if view_size is not None:
+        view_size = view_size[keep]
+    if view_shape is not None:
+        view_shape = view_shape[keep]
     if values_arr is not None:
         values_arr = values_arr[keep]
 
@@ -885,20 +900,18 @@ def add_electrodes(fig, electrodes: Union["ElectrodeSet", "Electrode"],
     elif color is None:
         color = "white"
 
-    # Sizes
+    # Sizes. An explicit `size_by=` wins, then the view's own vector, then the
+    # flat `size`.
     if size_by is not None:
-        raw = np.asarray(selected._field(size_by), dtype=np.float64)
-        finite = np.isfinite(raw)
-        sizes = np.full(len(selected), float(np.mean(size_range)))
-        if finite.any():
-            lo, hi = np.nanmin(raw[finite]), np.nanmax(raw[finite])
-            frac = np.zeros_like(raw) if hi == lo else (raw - lo) / (hi - lo)
-            sizes[finite] = size_range[0] + frac[finite] * (size_range[1] - size_range[0])
+        sizes = _electrode_sizes(
+            np.asarray(selected._field(size_by), dtype=np.float64), size_range)
+    elif view_size is not None:
+        sizes = _electrode_sizes(view_size, size_range)
     else:
         sizes = np.full(len(selected), float(size))
 
     # One scatter call per marker shape, since matplotlib takes one marker each.
-    marker_of = _electrode_markers(selected, marker)
+    marker_of = _electrode_markers(selected, marker, view_shape)
     _, ax = _get_fig_and_ax(fig)
     collections: dict[str, PathCollection] = {}
     for shape in sorted(set(marker_of)):
@@ -940,11 +953,42 @@ def _is_per_contact_color(color: Any) -> bool:
     return isinstance(color, np.ndarray) and color.ndim == 2
 
 
+def _electrode_sizes(raw: npt.NDArray[np.floating],
+                     size_range: tuple[float, float]) -> npt.NDArray[np.floating]:
+    """A per-electrode field mapped onto a marker-area range.
+
+    Min-max normalised, not literal. A marker area in points squared and a
+    contact diameter in millimetres are not the same quantity, and drawing
+    millimetres literally gives dots or blobs depending on the figure. The cost
+    is that two figures are not comparable: "every contact 5 mm" and "every
+    contact 2 mm" draw identically, because each is normalised against its own
+    range.
+    """
+    finite = np.isfinite(raw)
+    sizes = np.full(len(raw), float(np.mean(size_range)))
+    if finite.any():
+        lo, hi = np.nanmin(raw[finite]), np.nanmax(raw[finite])
+        frac = np.zeros_like(raw) if hi == lo else (raw - lo) / (hi - lo)
+        sizes[finite] = size_range[0] + frac[finite] * (size_range[1] - size_range[0])
+    return sizes
+
+
 def _electrode_markers(electrodes: "ElectrodeSet",
-                       marker: Optional[Union[str, dict]]) -> npt.NDArray[np.str_]:
-    """One matplotlib marker per electrode."""
+                       marker: Optional[Union[str, dict]],
+                       view_shape: Optional[npt.NDArray] = None) -> npt.NDArray[np.str_]:
+    """One matplotlib marker per electrode.
+
+    Precedence: an explicit ``marker=`` beats a view's ``marker_shape``, which
+    beats the device-type table -- the same explicit-argument-wins rule the rest
+    of this function follows.
+    """
     if isinstance(marker, str):
         return np.array([marker] * len(electrodes), dtype=object)
+    if marker is None and view_shape is not None:
+        return np.array(
+            [MARKER_BY_SHAPE.get(str(s), DEFAULT_MARKER) for s in view_shape],
+            dtype=object,
+        )
     table = MARKER_BY_GROUP_TYPE if marker is None else marker
     return np.array(
         [table.get(str(g).lower(), DEFAULT_MARKER) for g in electrodes.group_type],

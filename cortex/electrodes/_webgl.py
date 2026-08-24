@@ -64,7 +64,6 @@ def to_viewer_json(
     placeable_only: bool = True,
     radius: float = 1.5,
     color: str = "#ffcc33",
-    lift: float = 1.0,
 ) -> dict[str, Any]:
     """Serialise an electrode set for the browser.
 
@@ -86,13 +85,12 @@ def to_viewer_json(
         draw: an unplaced one would sit whereever its meaningless anchor pointed
         and look exactly like a real one.
     radius : float
-        Marker radius in millimetres, the same units as the surface.
+        Fallback marker radius in millimetres, the same units as the surface.
+        Each contact overrides it with half its own recorded diameter where the
+        montage has one, so markers are drawn at the size the electrodes are.
     color : str
         A CSS colour for every marker. One colour is all this carries -- colour
         by data value belongs with the ``Electrode`` views and their colormap.
-    lift : float
-        How far to stand a marker off the surface, in multiples of ``radius``,
-        so it reads as sitting on the cortex rather than sunk into it.
 
     Returns
     -------
@@ -121,6 +119,12 @@ def to_viewer_json(
         if hemi not in HEMIS:
             continue
         contacts.append({
+            # Its position in the montage. The browser needs it because this
+            # function *drops* contacts -- unplaceable ones, and any whose
+            # hemisphere did not resolve -- while a view's per-contact arrays are
+            # montage-length. Without it the browser can only count, and counting
+            # is wrong the moment anything is dropped.
+            "index": int(i),
             "name": str(eset.names[i]),
             "group": str(eset.group[i]),
             "group_type": str(eset.group_type[i]).lower(),
@@ -140,14 +144,18 @@ def to_viewer_json(
             "depth_mm": _finite(anchors.depth_mm[i]),
             "thickness_mm": _finite(anchors.thickness_mm[i]),
             "anatomy": str(eset.anatomy[i]),
+            "status": str(eset.status[i]),
+            "size": _finite(eset.size[i]),
             "placement": str(anchors.placement[i]),
         })
 
     return {
         "electrodes": contacts,
+        # How long a montage-indexed array should be, so the browser can notice
+        # when it is handed one that does not match.
+        "nelec": int(len(eset)),
         "radius": float(radius),
         "color": color,
-        "lift": float(lift),
         "subject": eset.subject,
     }
 

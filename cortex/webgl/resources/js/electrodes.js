@@ -22,19 +22,32 @@ var electrodes = (function(module) {
 
     module.DEFAULT_SHAPE = "sphere";
 
-    module.makeGeometries = function(radius) {
-        return {
-            sphere:  new THREE.SphereGeometry(radius, 12, 8),
-            cube:    new THREE.BoxGeometry(radius * 1.7, radius * 1.7, radius * 1.7),
-            diamond: new THREE.OctahedronGeometry(radius * 1.35),
-        };
-    }
+    // One geometry per shape and radius, shared between every contact that wants
+    // it. A montage records a handful of distinct diameters at most, so this
+    // stays a handful of geometries however many contacts there are.
+    module.makeGeometry = function(cache, shape, radius) {
+        var key = shape + ":" + radius.toFixed(3);
+        if (cache[key] === undefined) {
+            if (shape === "cube")
+                cache[key] = new THREE.BoxGeometry(radius * 1.7, radius * 1.7, radius * 1.7);
+            else if (shape === "diamond")
+                cache[key] = new THREE.OctahedronGeometry(radius * 1.35);
+            else
+                cache[key] = new THREE.SphereGeometry(radius, 12, 8);
+        }
+        return cache[key];
+    };
 
     module.Electrodes = function(json, posdata, surf) {
         this.surf = surf;
         this.posdata = posdata;
+        // Fallback radius, in millimetres. Each contact overrides it with half
+        // its own recorded diameter where the montage has one, so markers are
+        // drawn at the size the electrodes actually are.
         this.radius = json.radius === undefined ? 1.5 : json.radius;
-        this.lift = json.lift === undefined ? 1.0 : json.lift;
+        this.geometries = {};
+        this.subject = json.subject === undefined ? "" : json.subject;
+        this.nelec = json.nelec === undefined ? null : json.nelec;
         this._raw = new THREE.Vector3();   // scratch, reused every frame
         // How far, in millimetres, a contact may sit from the depth currently
         // being sampled and still be drawn on a deformed surface. Null shows
@@ -47,7 +60,6 @@ var electrodes = (function(module) {
         this.markers.right.name = "electrodes_right";
         this.contacts = [];
 
-        this.geometries = module.makeGeometries(this.radius);
         // Unlit: the scene carries no lights, so a Lambert or Phong material
         // would render black. Flat colour is also all this phase claims to do --
         // colouring by data is a later step and brings its own shader.
@@ -75,13 +87,21 @@ var electrodes = (function(module) {
             var verts = [
                 map[contact.verts[0]], map[contact.verts[1]], map[contact.verts[2]],
             ];
+            // What the montage says, kept so it can be restored when a view
+            // that overrode it is unbound.
             var shape = module.SHAPES[contact.group_type] || module.DEFAULT_SHAPE;
             // One material per contact rather than the shared one, so a contact
             // can take its own colour from data. They all start as copies of
             // the flat colour, so a page with no electrode data looks exactly as
             // it did before -- at the cost of one small material each, which for
             // a few hundred contacts is nothing.
-            var mesh = new THREE.Mesh(this.geometries[shape], this.material.clone());
+            // Half the recorded contact diameter, or the fallback. `size` is a
+            // diameter in millimetres; the geometries take a radius.
+            var radius = contact.size ? contact.size / 2 : this.radius;
+            var mesh = new THREE.Mesh(
+                module.makeGeometry(this.geometries, shape, radius),
+                this.material.clone()
+            );
             mesh.name = contact.name;
             this.markers[contact.hemi].add(mesh);
 
@@ -92,10 +112,21 @@ var electrodes = (function(module) {
                 rawVerts:   [contact.verts[0], contact.verts[1], contact.verts[2]],
                 weights:    contact.weights,
                 shape:      shape,
+                radius:     radius,
+                baseShape:  shape,
+                baseRadius: radius,
+                // Position in the montage. Not the same as this contact's index
+                // in `contacts`, because the payload drops unplaceable ones --
+                // a view's arrays are montage-length and must be read by this.
+                index:      contact.index === undefined ? i : contact.index,
                 mesh:       mesh,
                 name:       contact.name,
                 group:      contact.group,
                 group_type: contact.group_type,
+                anatomy:    contact.anatomy,
+                status:     contact.status,
+                placement:  contact.placement,
+                size:       contact.size,
                 depth:      contact.depth,
                 depth_mm:   contact.depth_mm,
                 thickness:  contact.thickness_mm,
@@ -105,13 +136,17 @@ var electrodes = (function(module) {
         this._buildLabels();
         this._bindHover();
 
+        this._buildFilters();
+        this._bindClick();
+
         this.ui = (new jsplot.Menu()).add({
             visible: {action:[this, "setVisible"]},
-            radius:  {action:[this, "setRadius", 0.5, 6.0]},
-            lift:    {action:[this, "setLift", 0.0, 4.0]},
             labels:  {action:[this, "setLabels"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
+            shape: {action:[this, "setShape", ["auto", "sphere", "cube", "diamond"]]},
         });
+        if (this._filterFields.length)
+            this.ui.addFolder("filter", true, this.filterUI);
     }
 
     // Re-place every marker for the current inflation and depth. Called on each
@@ -141,7 +176,8 @@ var electrodes = (function(module) {
             if (t <= 0) {
                 // Anatomical surface: every contact is at its measured position,
                 // so there is no "sampled depth" to be near or far from.
-                contact.mesh.visible = this._visible;
+                contact.mesh.visible = this._visible && this._passesFilters(contact);
+
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
@@ -152,18 +188,13 @@ var electrodes = (function(module) {
             // drawn. Hide it rather than project it onto a surface it is not
             // near, which is the same reasoning as the placement policy: draw
             // what is there, not what would look tidy.
-            contact.mesh.visible = this._visible && this._nearSampledDepth(contact, evt.thickmix);
+            contact.mesh.visible = this._visible && this._passesFilters(contact) && this._nearSampledDepth(contact, evt.thickmix);
             if (!contact.mesh.visible)
                 continue;
 
             var vert = mriview.get_position_bary(
                 this.posdata[contact.hemi], evt.mix, evt.thickmix,
                 contact.verts, contact.weights
-            );
-            // Stand the marker off along the local normal, so it reads as sitting
-            // on the cortex rather than half sunk into it.
-            vert.pos.add(
-                vert.norm.normalize().multiplyScalar(this.radius * this.lift)
             );
             contact.mesh.position.copy(
                 t >= 1 ? vert.pos : this._raw.lerp(vert.pos, t)
@@ -263,7 +294,45 @@ var electrodes = (function(module) {
     // electrodes, so the markers go back to their flat colour.
     module.Electrodes.prototype.setDataView = function(dataview) {
         this.dataview = (dataview && dataview.electrode) ? dataview : null;
+        this._applyViewMarkers();
         this.setValues();
+    };
+
+    // Size and shape from the bound view, falling back to the montage.
+    //
+    // The montage records each contact's physical diameter, which is the right
+    // default and the same for every dataset drawn on it. A view's vectors are
+    // for when the data should drive the marker instead. Unbinding a view -- or
+    // binding one that carries nothing -- restores the montage, which is why
+    // every contact keeps its baseRadius and baseShape.
+    module.Electrodes.prototype._applyViewMarkers = function() {
+        var attrs = this.dataview ? (this.dataview.attrs || {}) : {};
+        var sizes = attrs.marker_size || null;
+        var shapes = attrs.marker_shape || null;
+
+        if (sizes !== null && this.nelec !== null && sizes.length !== this.nelec)
+            console.warn("marker_size has " + sizes.length + " entries but the "
+                       + "montage has " + this.nelec + " contacts");
+
+        for (var i = 0; i < this.contacts.length; i++) {
+            var c = this.contacts[i];
+            // By montage index, never by position: the payload drops
+            // unplaceable contacts, so the two disagree the moment any montage
+            // has one.
+            var size = sizes === null ? null : sizes[c.index];
+            var radius = (size === null || size === undefined) ? c.baseRadius : size / 2;
+            var shape = this._shapeOverride
+                || (shapes === null ? null : shapes[c.index])
+                || c.baseShape;
+
+            c.radius = radius;
+            c.shape = shape;
+            c.mesh.geometry = module.makeGeometry(this.geometries, shape, radius);
+            if (c.label !== undefined)
+                c.label.scale.set(radius * 4 * c.labelAspect, radius * 4, 1);
+        }
+        this._placeLabels();
+        this._refresh();
     };
 
     // Recolour every contact from the bound dataview's current frame. Cheap
@@ -409,7 +478,10 @@ var electrodes = (function(module) {
             // Scaled off the marker radius so labels stay legible whatever the
             // brain is measured in -- pycortex surfaces are millimetres, the
             // viewer this came from used metres.
-            var label = module.makeLabelSprite(contact.name, this.radius * 4);
+            var label = module.makeLabelSprite(contact.name, contact.radius * 4);
+            // The sprite's texture is size-independent, so a later radius change
+            // only has to rescale it -- keep the aspect to do that with.
+            contact.labelAspect = label.scale.x / label.scale.y;
             label.visible = false;
             contact.label = label;
             this.labels.push(label);
@@ -505,6 +577,156 @@ var electrodes = (function(module) {
         return this._hovered === null ? "" : this._hovered.name;
     };
 
+    // -- filtering -----------------------------------------------------------
+    //
+    // Dropdowns are built from the values this montage actually contains, so a
+    // file with no anatomy column gets no anatomy filter rather than an empty
+    // one. Filters compose: each is null for "no restriction", and a contact has
+    // to pass all of them.
+    // -- click-through metadata ----------------------------------------------
+    //
+    // Bound on mouseup rather than click, and only when the pointer has barely
+    // moved: dragging to rotate the brain ends on whatever mesh it started from
+    // and would otherwise open the panel every time you turned the head.
+    module.Electrodes.prototype._bindClick = function() {
+        var brain = $("#brain");
+        brain.on("mousedown.electrodes", function(evt) {
+            this._downAt = {x: evt.pageX, y: evt.pageY};
+        }.bind(this));
+        brain.on("mouseup.electrodes", function(evt) {
+            var d = this._downAt;
+            this._downAt = null;
+            if (!d || Math.abs(evt.pageX - d.x) > 4 || Math.abs(evt.pageY - d.y) > 4)
+                return;                      // that was a drag, not a click
+            var el = $("#brain"), off = el.offset();
+            this.select(this._pickNDC(
+                ((evt.pageX - off.left) / el.width()) * 2 - 1,
+                -((evt.pageY - off.top) / el.height()) * 2 + 1
+            ));
+        }.bind(this));
+    };
+
+    module.Electrodes.prototype.select = function(contact) {
+        this._selected = contact || null;
+        var panel = $("#electrode_info");
+        if (!panel.length)
+            return this.selected();
+        if (this._selected === null) {
+            panel.css("display", "none");
+            return "";
+        }
+
+        // Only the fields this montage actually carries. A row reading
+        // "anatomy: --" is worse than no row: it looks like missing data rather
+        // than like a column the file never had.
+        var rows = [["electrode", contact.name]];
+        if (this.subject) rows.push(["participant", this.subject]);
+        var optional = [["group", contact.group], ["type", contact.group_type],
+                        ["anatomy", contact.anatomy], ["status", contact.status]];
+        for (var i = 0; i < optional.length; i++)
+            if (optional[i][1]) rows.push(optional[i]);
+        if (contact.depth_mm !== null && contact.depth_mm !== undefined)
+            rows.push(["depth", contact.depth_mm.toFixed(1) + " mm from pia"]);
+        if (contact.placement)
+            rows.push(["placement", contact.placement.replace(/_/g, " ")]);
+        if (contact.value !== null && contact.value !== undefined)
+            rows.push(["value", (+contact.value).toPrecision(4)]);
+
+        var html = "";
+        for (var i = 0; i < rows.length; i++)
+            html += "<div class='erow'><span class='ekey'>" + rows[i][0] +
+                    "</span><span class='eval'>" + rows[i][1] + "</span></div>";
+        panel.html(html).css("display", "block");
+        return contact.name;
+    };
+
+    module.Electrodes.prototype.selected = function() {
+        return this._selected ? this._selected.name : "";
+    };
+
+    // Select from normalised coordinates, as a click would. Keeps the panel
+    // testable without synthesising DOM events.
+    module.Electrodes.prototype.selectAt = function(x, y) {
+        return this.select(this._pickNDC(x, y));
+    };
+
+    module.Electrodes.prototype._distinct = function(field) {
+        var seen = {}, out = [];
+        for (var i = 0; i < this.contacts.length; i++) {
+            var v = this.contacts[i][field];
+            if (v && seen[v] === undefined) {
+                seen[v] = true;
+                out.push(v);
+            }
+        }
+        return out.sort();
+    };
+
+    module.Electrodes.prototype._buildFilters = function() {
+        this.filters = {group: null, group_type: null, anatomy: null, status: null};
+        this.filterUI = new jsplot.Menu();
+        this._filterFields = [];
+
+        var fields = [["group", "group"], ["group_type", "type"],
+                      ["anatomy", "anatomy"], ["status", "status"]];
+        for (var i = 0; i < fields.length; i++) {
+            var field = fields[i][0], label = fields[i][1];
+            // The setter exists for every field, whatever this montage
+            // contains, so the API does not change shape with the data. Only
+            // the *dropdown* is conditional -- one distinct value is nothing to
+            // choose between, and an empty menu is clutter.
+            this._makeFilterSetter(field);
+            var values = this._distinct(field);
+            if (values.length < 2)
+                continue;
+            var desc = {};
+            desc[label] = {action: [this, "filter_" + field, ["all"].concat(values)]};
+            this.filterUI.add(desc);
+            this._filterFields.push(field);
+        }
+    };
+
+    // dat.GUI binds one control to one named method, so each field needs its
+    // own setter. Generated rather than written out four times.
+    module.Electrodes.prototype._makeFilterSetter = function(field) {
+        this["filter_" + field] = function(val) {
+            if (val === undefined)
+                return this.filters[field] === null ? "all" : this.filters[field];
+            this.filters[field] = (val === "all") ? null : val;
+            this._refresh();
+        }.bind(this);
+    };
+
+    module.Electrodes.prototype._passesFilters = function(contact) {
+        for (var field in this.filters) {
+            var want = this.filters[field];
+            if (want !== null && contact[field] !== want)
+                return false;
+        }
+        return true;
+    };
+
+    // How many contacts are currently drawn. A plain number, so it survives the
+    // trip to python and a test can assert on it.
+    module.Electrodes.prototype.countVisible = function() {
+        var n = 0;
+        for (var i = 0; i < this.contacts.length; i++)
+            if (this.contacts[i].mesh.visible) n++;
+        return n;
+    };
+
+    // -- appearance ----------------------------------------------------------
+
+    // A global override on top of the bound view's shapes. "auto" clears it and
+    // hands control back -- without that the menu would win permanently after
+    // one click and a view's own shapes would be unrecoverable.
+    module.Electrodes.prototype.setShape = function(val) {
+        if (val === undefined)
+            return this._shapeOverride || "auto";
+        this._shapeOverride = (val === "auto") ? null : val;
+        this._applyViewMarkers();
+    };
+
     module.Electrodes.prototype.setLabels = function(val) {
         if (val === undefined)
             return !!this._labelsOn;
@@ -521,7 +743,7 @@ var electrodes = (function(module) {
         for (var i = 0; i < this.contacts.length; i++) {
             var contact = this.contacts[i];
             contact.label.position.copy(contact.mesh.position);
-            contact.label.position.z += this.radius * 2.5;
+            contact.label.position.z += contact.radius * 2.5;
             contact.label.visible = contact.mesh.visible
                 && (!!this._labelsOn || contact === this._hovered);
         }
@@ -534,26 +756,6 @@ var electrodes = (function(module) {
         this.markers.left.visible = val;
         this.markers.right.visible = val;
         this.surf.dispatchEvent({type:"update"});
-    }
-
-    module.Electrodes.prototype.setRadius = function(val) {
-        if (val === undefined)
-            return this.radius;
-        this.radius = val;
-        var geometries = module.makeGeometries(val);
-        for (var i = 0; i < this.contacts.length; i++)
-            this.contacts[i].mesh.geometry = geometries[this.contacts[i].shape];
-        for (var shape in this.geometries)
-            this.geometries[shape].dispose();
-        this.geometries = geometries;
-        this._refresh();
-    }
-
-    module.Electrodes.prototype.setLift = function(val) {
-        if (val === undefined)
-            return this.lift;
-        this.lift = val;
-        this._refresh();
     }
 
     // Re-place the markers at the surface's current state, for a change that did
@@ -573,6 +775,7 @@ var electrodes = (function(module) {
                 name: contact.name, group: contact.group,
                 group_type: contact.group_type, hemi: contact.hemi,
                 depth: contact.depth, shape: contact.shape,
+                radius: contact.radius, index: contact.index,
                 visible: contact.mesh.visible,
                 color: contact.mesh.material.color.getHex(),
                 verts: contact.verts, weights: contact.weights,
