@@ -207,35 +207,96 @@ class TestMarkersInTheViewer:
             reported = reported[0]
         return reported
 
-    def test_the_depth_window_follows_the_sampled_surface(self):
-        """A deformed surface shows one depth through the ribbon at a time.
+    def _visible_at(self, thickmix):
+        handle = type(self).handle
+        handle.ui.set("surface.S1.depth", thickmix)
+        time.sleep(1.5)
+        reported = handle.surfs[0].surf.electrodes.describe()
+        while (isinstance(reported, list) and len(reported) == 1
+               and isinstance(reported[0], list)):
+            reported = reported[0]
+        return {c["name"] for c in reported if c["visible"]}
 
-        A contact that is not at that depth is not on the sheet being drawn, so
-        it is hidden rather than projected onto a surface it is nowhere near --
-        the same reasoning as the placement policy. Which contacts survive has
-        to change when the depth slider moves from pia to white matter; if it
-        does not, the slider is writing the uniform without telling anything
-        that positions itself on the CPU, which is exactly the bug this pins.
+    def test_the_depth_window_is_off_by_default(self):
+        """Only the placement policy decides whether a contact is drawn.
+
+        The window used to default to 2 mm and to ride the surface's depth
+        slider, which itself defaults to mid-ribbon. That hid 53 of 143
+        placeable contacts of a real montage on load -- every one of the 35
+        sitting outside the pia among them -- and said nothing. Worse, measured
+        from the pia it asks the same question as the policy's
+        `max_surface_distance_mm` and answered it more strictly, so a contact
+        that passed the 4 mm projection gate was hidden by a 2 mm window
+        anyway. Two gates, one of them invisible.
         """
         handle = type(self).handle
+        electrodes = handle.surfs[0].surf.electrodes
+        assert electrodes.setDepthWindow() in (20, [20]), "window is not off"
+
         handle.ui.set("surface.S1.unfold", 0.5)
         time.sleep(1.5)
-
-        def visible_at(thickmix):
-            handle.ui.set("surface.S1.depth", thickmix)
+        try:
+            at_pia, at_wm = self._visible_at(0.0), self._visible_at(1.0)
+        finally:
+            handle.ui.set("surface.S1.unfold", 0.0)
             time.sleep(1.5)
-            reported = handle.surfs[0].surf.electrodes.describe()
-            while (isinstance(reported, list) and len(reported) == 1
-                   and isinstance(reported[0], list)):
-                reported = reported[0]
-            return {c["name"] for c in reported if c["visible"]}
 
-        at_pia, at_wm = visible_at(0.0), visible_at(1.0)
-        handle.ui.set("surface.S1.unfold", 0.0)
+        assert len(at_pia) == len(type(self).eset), "the default hid contacts"
+        assert at_pia == at_wm, "the depth slider changed what is drawn"
+
+    def test_the_depth_window_is_measured_from_the_pia(self):
+        """Set, it is a distance from the pia rather than from the slider.
+
+        The slider's mid-ribbon default is a fine place to render a surface and
+        a bad place to look for electrodes: a subdural contact sits above the
+        pia by construction and is never near the middle of the ribbon.
+        """
+        handle = type(self).handle
+        electrodes = handle.surfs[0].surf.electrodes
+        handle.ui.set("surface.S1.unfold", 0.5)
         time.sleep(1.5)
+        electrodes.setDepthWindow(2.0)
+        time.sleep(1)
+        try:
+            at_pia, at_wm = self._visible_at(0.0), self._visible_at(1.0)
+        finally:
+            electrodes.setDepthWindow(20)
+            handle.ui.set("surface.S1.unfold", 0.0)
+            time.sleep(1.5)
 
-        # A grid sits at the pia, so sampling there shows it and sampling the
-        # white matter does not.
+        assert at_pia, "nothing visible when sampling the pial surface"
+        assert at_pia == at_wm, (
+            "the depth slider changed what is drawn, so the window is riding "
+            "it rather than the pia"
+        )
+
+    def test_the_depth_window_can_be_asked_to_follow_the_slider(self):
+        """The old behaviour, kept for sweeping through the ribbon deliberately.
+
+        Turned on, a deformed surface shows one depth at a time and a contact
+        that is not at that depth is not on the sheet being drawn. Which
+        contacts survive then has to change as the slider moves; if it does
+        not, the slider is writing the uniform without telling anything that
+        positions itself on the CPU, which is the bug the original version of
+        this test pinned.
+        """
+        handle = type(self).handle
+        electrodes = handle.surfs[0].surf.electrodes
+        handle.ui.set("surface.S1.unfold", 0.5)
+        time.sleep(1.5)
+        electrodes.setDepthWindow(2.0)
+        electrodes.setDepthFollowsSlider(True)
+        time.sleep(1)
+        try:
+            at_pia, at_wm = self._visible_at(0.0), self._visible_at(1.0)
+        finally:
+            electrodes.setDepthFollowsSlider(False)
+            electrodes.setDepthWindow(20)
+            handle.ui.set("surface.S1.unfold", 0.0)
+            time.sleep(1.5)
+
+        # The fixture's grid sits at the pia, so sampling there shows it and
+        # sampling the white matter does not.
         assert at_pia, "nothing visible when sampling the pial surface"
         assert at_pia != at_wm, "the depth slider did not change what is drawn"
         assert len(at_wm) < len(at_pia)

@@ -278,11 +278,22 @@ Three consequences:
 - **An electrode's position tracks `thickmix` for free.** `get_position` already
   interpolates pia-to-wm; the barycentric variant inherits it. The marker moves
   with the surface under both inflation and depth.
-- **Visibility is a function of `|d - thickmix|`.** Fade opacity across a
-  tolerance band rather than switching — a hard cutoff pops as the slider moves,
-  and the fade also communicates *how far* off-depth a contact is. An ECoG grid
-  (`d` near 0) is fully visible in the default view; sliding toward white matter
-  brings the deeper contacts up as the surface ones fade.
+- **Visibility is *not* a function of `|d - thickmix|`** — this was tried and
+  reverted. Making the slider gate visibility means the slider's own default,
+  mid-ribbon, decides what a montage looks like on load, and mid-ribbon is the
+  one depth a subdural contact can never be at. On a real montage it hid 53 of
+  143 placeable contacts, all 35 of the outside-the-pia ones among them,
+  silently. Anchoring the window to the pia instead only moved the problem:
+  it then asks the same question as `PlacementPolicy.max_surface_distance_mm`
+  and answers it more strictly, so a contact that passed the 4 mm projection
+  gate was hidden by a 2 mm window anyway — two gates for one question, and the
+  stricter one invisible and unconfigurable from python.
+
+  So the depth window is **off by default** and the placement policy alone
+  decides what is drawn. The window survives as an exploration control: set it,
+  turn on `depth_follows_slider`, and sweeping the slider walks the montage
+  through the ribbon. That is what it is good for, and it is opt-in because
+  wanting it is a deliberate act rather than the common case.
 - **The common ECoG case lands correctly with no special-casing.** Grid and strip
   contacts sit slightly *above* pia (dura, contact thickness), giving small
   negative `d`, which clamps to 0 and shows in the default view.

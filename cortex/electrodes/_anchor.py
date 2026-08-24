@@ -25,8 +25,14 @@ outside the brain and ``d > 1`` past the white matter. This is deliberately the
 same quantity the webgl viewer already interpolates: ``brainctm`` builds the CTM
 with the pial surface as its base and white matter as an auxiliary attribute, and
 ``mriview.get_position`` mixes the two by ``thickmix`` -- so an electrode's depth
-and the viewer's depth slider are the same number, and the slider can select
-which electrodes are drawn.
+and the viewer's depth slider are the same number, and the slider *can* be asked
+to select which electrodes are drawn.
+
+It does not by default, and that is deliberate. The slider starts mid-ribbon,
+where a subdural contact never is, so letting it gate visibility means the
+montage arrives with a third of itself missing and nothing said about it. What
+decides whether a contact is drawn is the placement policy, in python, where it
+is configurable and reports what it excluded.
 
 Nothing here mutates the electrode's TkRegRAS coordinate. Anchors are derived,
 carry a hash of the surfaces they were computed against, and can be thrown away

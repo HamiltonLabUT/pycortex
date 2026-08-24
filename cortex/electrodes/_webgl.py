@@ -180,8 +180,12 @@ def to_viewer_json(
     # to reach -- and chaining straight past the gap keeps a shank with one
     # unplaceable contact a single unbroken probe.
     drawn = np.asarray(drawn, dtype=int)
+    # The same surface-space coordinates the markers are drawn at. Which pairs
+    # are neighbours is decided from a device's own contacts, so it is invariant
+    # to the shift and either array gives the same edges -- but one function
+    # holding two coordinate frames is how the next mistake gets made.
     edges = [] if not connections else group_edges(
-        eset.coords[drawn], eset.group[drawn], eset.group_type[drawn],
+        coords[drawn], eset.group[drawn], eset.group_type[drawn],
         names=eset.names[drawn],
     )
 
