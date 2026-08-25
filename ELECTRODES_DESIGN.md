@@ -330,7 +330,7 @@ position is not possible and no amount of care makes it so.
 | `cortex/tests/test_electrodes.py` | `ElectrodeSet`, group inference, IO round-trip |
 | `cortex/tests/test_electrode_anchor.py` | Anchoring maths against a synthetic surface; placement policy; every `placement` outcome |
 | `cortex/tests/test_electrode_space.py` | The space + three views, modelled on `test_new_space.py` |
-| `cortex/tests/test_electrode_webgl.py` | Headless viewer, following `test_webgl_headless.py` |
+| `cortex/tests/test_electrodes_webgl.py` | Headless viewer, following `test_webgl_headless.py` |
 | `examples/electrodes/plot_electrodes_flatmap.py` | Flatmap example |
 | `examples/electrodes/plot_electrodes_webgl.py` | Viewer example |
 | `docs/electrodes.rst` | User guide |
@@ -419,14 +419,24 @@ Each phase is independently verifiable and independently useful.
   strip, diamond for seeg and depth — so a reader can tell which positions to
   trust without consulting a legend. Marker *size* is constant in figure units
   and deliberately not scaled by areal distortion, per 2.2.
-- **P2** — `ElectrodeSpace` and the three views: colormapping, HDF, movies.
+- **P2** — *done.* `ElectrodeSpace` and the three views: `Electrode`,
+  `Electrode2D`, `ElectrodeRGB`, colormapping, movies and HDF round-tripping,
+  plus the montage layer in `database.py` (`get_montage` / `save_montage` /
+  `list_montages`) that keeps "whose electrodes" and "whose surfaces" apart.
+  A third webgl encoding, `ElectrodeValues`, was needed after all: neither
+  existing one can carry an array indexed by contact. `test_electrode_space.py`.
 - **P3a** — *done.* Markers in the viewer: one mesh per contact parented into
   `pivots[hemi].back`, re-placed on every `mix` event via a barycentric sibling
-  of `get_position`, shape by group type, one flat colour, and a menu folder for
-  visibility, radius and stand-off. No shader changes, no new payload format —
-  the anchors ride inside `viewopts`.
-- **P3b** — colours from data, hover tooltip, click-through metadata panel,
-  filtering by group and anatomy.
+  of `get_position`, shape by group type, one flat colour, and a menu folder.
+  No shader changes, no new payload format — the anchors ride inside `viewopts`.
+  The folder's radius and stand-off controls did not survive: markers are sized
+  from the montage's recorded contact diameter, and lift was dropped once the
+  markers were drawn at their measured coordinate on the anatomical surface.
+- **P3b** — *done.* Colours from data — the marker samples the colormap texture
+  the viewer already loads, so `vmin`/`vmax` and movie scrubbing recolour
+  contacts exactly as they recolour a `Vertex`; hover labels; a click-through
+  metadata panel; and a `filter` sub-folder with a dropdown per field that this
+  montage actually varies in — group, type, anatomy, status.
 - **P3c** — *done.* Connection lines: a thin segment between contacts that are
   neighbours on the same device, with a `connections` checkbox in the electrodes
   folder, on by default. Not in the original phasing; it belongs beside P3b's
@@ -439,7 +449,7 @@ Each phase is independently verifiable and independently useful.
   would make the topology depend on the inflation slider, with edges appearing
   and disappearing mid-morph, when the fact being drawn is a property of the
   physical device. See 6 below for how a grid's lattice is recovered.
-- **P4** — billboards for STRF and evoked data.
+- **P4** — billboards for STRF and evoked data. Not started.
 
 ## 3. Decisions taken
 
@@ -585,12 +595,32 @@ recovery gets wrong. It is not needed to draw the montages we have.
 
 ## 7. Still to settle
 
-- **quickflat's depth argument.** `make_figure` already takes `depth` for
-  volumetric sampling. `add_electrodes` needs its own depth selection, and
-  whether the two should share a value or stay independent is a usability call
-  better made once P1 is drawable. Default proposed: `depth=None` draws every
-  electrode, a float selects a band.
-- **Marker shape vocabulary.** The design document asks for a shape dropdown per
-  electrode type. The set of shapes, and whether shape is driven by `group_type`
-  by default, is worth fixing before P3 so the instanced-mesh code builds the
-  right number of geometries.
+Both of the questions this section opened with have since been answered, in
+the course of P1 and P3. Recorded here rather than deleted, because the answers
+are the kind that get re-litigated:
+
+- **quickflat's depth argument.** *Settled: independent.* `add_electrodes` takes
+  its own `depth`, defaulting to `None` — draw every contact — with a float or a
+  pair selecting a band. It does not share `make_figure`'s `depth`, which is the
+  volumetric *sampling* depth for `add_data`: someone sampling their fMRI at
+  `depth=0.5` has not thereby asked to hide all but mid-ribbon contacts.
+- **Marker shape vocabulary.** *Settled: four shapes, driven by `group_type`.*
+  Circle/sphere for a grid, square/cube for a strip, diamond for seeg and depth,
+  and the viewer's `shape` control can force any one of them with `auto` as the
+  default. Fixing this before P3 was the right call for the reason given — the
+  viewer builds one geometry per shape up front.
+
+What is genuinely open:
+
+- **P4 has no design yet.** Billboards for STRF and evoked data are the last
+  unstarted phase. The per-channel auxiliary arrays they would draw already have
+  somewhere to live — `ElectrodeSet` metadata is per-contact and untyped — but
+  nothing about the drawing has been thought through: whether a billboard is a
+  sprite or a DOM overlay, how it scales with zoom, and what happens when
+  sixty-four of them overlap on a folded surface.
+- **`cortex.db.S1.electrodes` was never wired up.** 2.5 asks for a `SubjectDB`
+  attribute so a subject's electrodes resolve like `.surfaces`. The `Database`
+  methods all exist — `get_electrodes`, `save_electrodes`, `list_electrodes`,
+  and the montage trio — but the attribute on `SubjectDB` does not, so the
+  convenience accessor in that bullet does not work. Small, and worth doing
+  before the guide's readers try it.

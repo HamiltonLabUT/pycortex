@@ -68,6 +68,9 @@ dataset
     Vertex
     Vertex2D
     VertexRGB
+    Electrode
+    Electrode2D
+    ElectrodeRGB
     Dataset
 
 All the other modules
@@ -109,6 +112,39 @@ database
     :template:class.rst
 
     Database
+
+
+electrodes
+----------
+
+.. automodule:: cortex.electrodes
+
+.. autosummary::
+    :toctree:generated/
+    :template:class.rst
+
+    ElectrodeSet
+    ElectrodeAnchors
+    PlacementPolicy
+    AlignmentReport
+
+.. autosummary::
+    :toctree:generated/
+
+    load_electrodes
+    read_electrodes_tsv
+    read_elecs_mat
+    write_electrodes_tsv
+    load_electrodes_json
+    save_electrodes_json
+    load_surface_pairs
+    anchor_to_surfaces
+    classify_placement
+    check_alignment
+    check_hemispheres
+    group_edges
+    infer_group
+    infer_index
 
 
 freesurfer

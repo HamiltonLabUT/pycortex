@@ -489,3 +489,83 @@ against a synthetic ten-element geometry, and exercises construction, movies,
 `.raw`, `to_json`, HDF round-tripping, rendering through `quickflat`, and both
 outcomes of `pack_for_webgl`. Copy from there rather than from `VolumeSpace` or
 `SurfaceSpace`, which carry volume- and surface-specific detail you do not need.
+
+## Postscript: what `ElectrodeSpace` found
+
+`ElectrodeSpace` is the first space added through this document, so it is also
+the first test of it. Most of the above held. Three things are worth recording:
+one claim that turns out to be avoidable, one branch that had to be generalized
+rather than extended, and one failure mode the document does not warn about.
+
+### The "own attribute set and own draw call" claim is escapable
+
+Under *If neither encoding fits*, step 2 says that geometry which is not
+per-vertex — point sprites, instanced spheres — needs its own attribute set and
+its own draw call, "the largest piece of work here". That is true, and it is why
+electrodes do none of it.
+
+Contacts are drawn as ordinary `THREE.Mesh` objects parented into
+`pivots[hemi].back`, beside the picker and the SVG overlay, and re-placed on
+every `mix` event from a barycentric anchor. The surface's shaders are untouched:
+there is no third `Shaders.surface_*` function, no new flag on
+`DataView.getShader`, and no third branch on `dataview.vertex`. Colour is looked
+up in JavaScript instead — the viewer already loads every colormap as an `<img>`,
+so rasterising one into a canvas once and sampling it per contact recolours the
+markers from the same `vmin`/`vmax` sliders and the same movie frame the shader
+would have used.
+
+So the rule is narrower than it reads: *if your geometry must be composited with
+the surface data in one pass*, you are writing a shader. If it merely has to sit
+in the same scene and move with the surface, add scene objects and leave the
+render path alone. The price of the cheap route is that the markers are not
+composited with the cortex, so they need their own depth-test handling — when
+the surface goes translucent, blending does not remove it from the depth buffer
+and a contact inside the brain stays culled until `depthTest` is turned off for
+the markers.
+
+### Step 1 was needed, and it was a generalization
+
+The payload side of *If neither encoding fits* was unavoidable: neither existing
+encoding fits an array indexed by contact, because `MosaicTexture` tiles a 3-D
+grid and `VertexAttributes` permutes into the CTM's vertex order and
+premultiplies alpha. `ElectrodeValues` is the third encoding and the plainest of
+the three — one `.npy`, in the order given.
+
+The document warns that `module.DataView` repeats `fromJSON`'s
+`mosaic === undefined` test and that "a third kind needs it generalized, not just
+extended". That was exactly right, and both copies are now gone: `payloadClass`
+is a lookup keyed on `nelec`, and `DataView` carries a `kind` string that
+`this.vertex` and `this.electrode` are derived from. Two copies of a two-way test
+disagreeing is a worse bug than either copy.
+
+Note also which declaration `nelec` comes from. It is the *space*'s, emitted by
+`describe_layout`, not the payload's `describe`, because it describes the montage
+rather than the encoding — and it must be absent from every other kind, since the
+JS tests for `undefined`.
+
+### A space whose values are not per-vertex will blank the cortex
+
+The one thing nothing above predicts. Surface geometry is loaded with
+`data0`..`data3` and `nanmask` empty, and filling them is the dataview's
+business. A space whose values are not per-vertex never fills them — an electrode
+view's values are indexed by contact and ride with the markers — so the draw call
+binds a zero-byte buffer for an attribute the shader still reads. WebGL rejects
+the whole call with `INVALID_OPERATION`, and the cortex vanishes while the new
+geometry keeps drawing perfectly, which is a confusing way to find out.
+
+`Surface._blankDataAttributes` fills them with zeros. Zeros are the right filler
+rather than merely a safe one: a scalar view reads `nanmask` as 0 and discards the
+data layer, an RGB view reads the fourth component as alpha and composites
+nothing, and both leave the curvature showing — which is what a cortex carrying
+no data should look like. An electrode view is blanked on *every* switch rather
+than only when the attributes are too short, since arriving from a vertex view
+would otherwise leave the previous dataset's colours painted under the markers.
+
+### Two smaller confirmations
+
+- `xfmname` returns `None`, per *Choosing what `xfmname` returns*. Electrodes are
+  not sampled through a transform.
+- `from_hdf` discriminates on `montage`, an attribute `write_hdf_attrs` writes
+  itself, rather than on `hdf_key`. It has to: the discriminator must be present
+  whether the contacts were embedded in the file or were too large and left to be
+  re-read from the filestore, and `hdf_key` is only in one of those cases.
