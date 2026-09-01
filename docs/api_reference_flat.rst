@@ -143,6 +143,10 @@ electrodes
     check_alignment
     check_hemispheres
     group_edges
+    surface_weights
+    volume_weights
+    weighted_mean
+    total_weight
     infer_group
     infer_index
 

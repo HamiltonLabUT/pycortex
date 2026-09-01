@@ -27,6 +27,16 @@ Typical use::
 
     grids = eset.select(group_type=["grid", "strip"], placeable=True)
     xyz = grids.positions("flat")           # follows the surface, flat or not
+
+A montage of any size reads better as a field than as a field of dots, and
+:mod:`cortex.electrodes._blobs` turns one into the other: each contact's value
+spread over the cortex within a few millimetres of it, measured along the
+surface rather than through it. The result is an ordinary
+:class:`cortex.Vertex`, so everything that already draws one draws this::
+
+    elec = cortex.Electrode(values, "S1", "native")
+    cortex.quickshow(elec.to_vertex(sigma=3))       # what the contacts say
+    cortex.quickshow(elec.coverage(sigma=3))        # where they can say it
 """
 
 from __future__ import annotations
@@ -58,6 +68,14 @@ from ._io import (
     save_electrodes_json,
     to_dict,
     write_electrodes_tsv,
+)
+from ._blobs import (
+    DEFAULT_SIGMA,
+    RADIUS_SIGMAS,
+    surface_weights,
+    total_weight,
+    volume_weights,
+    weighted_mean,
 )
 from ._connect import GRID_SLACK, LINEAR_TYPES, group_edges
 from ._webgl import to_viewer_json
@@ -96,6 +114,13 @@ __all__ = [
     "TOO_FAR",
     "UNKNOWN_ANATOMY",
     "PLACEMENTS",
+    # spreading a contact's value over the cortex around it
+    "surface_weights",
+    "volume_weights",
+    "weighted_mean",
+    "total_weight",
+    "DEFAULT_SIGMA",
+    "RADIUS_SIGMAS",
     # sanity checks
     "AlignmentReport",
     "check_alignment",

@@ -397,6 +397,93 @@ That is not a quirk but the only thing that can work: every renderer reads
 subject there would draw fsaverage coordinates on that patient's cortex.
 
 
+Spreading values over cortex
+----------------------------
+
+A montage drawn as markers is fine for sixty-four contacts and unreadable for
+six hundred, and it cannot be compared against a surface or volumetric result
+from the same subject at all -- one is a scatter of dots, the other a field.
+:meth:`cortex.Electrode.to_vertex` makes them the same kind of thing: each
+contact's value spread over the cortex within a few millimetres of it, overlaps
+averaged, the result an ordinary :class:`cortex.Vertex`::
+
+    elec = cortex.Electrode(values, "S1", "native")
+    cortex.quickshow(elec.to_vertex(sigma=4))
+
+``sigma`` is the blob's width in millimetres and the only number that usually
+needs setting; the grid's own pitch is a good starting point, since adjacent
+contacts then overlap and get averaged while distant ones do not reach each
+other. The cutoff follows at three sigma unless ``radius`` says otherwise --
+deriving it rather than fixing it is what stops a wider blob coming back
+squared off at a hard edge.
+
+Distances are measured **along the cortical surface**, and that is the point.
+The two banks of a sulcus are a few millimetres apart through space and a couple
+of centimetres apart across cortex, and a subdural contact on one bank is not
+recording from the other; the two medial walls are closer still, so a search
+that does not know about hemispheres puts a left-hemisphere value on the right
+hemisphere. Measuring on the surface rules both out. ``metric="euclidean"``
+measures through space instead: about ten times faster, visibly smoother, and
+smooth for a reason that is not in the data. Use it for a first look at a large
+montage, not for a figure.
+
+Two more things follow from where the numbers come from. Blobs are centred where
+a contact *anchors* on the surface, not on the contact itself -- otherwise a
+depth electrode's blob would fade in proportion to how far it was driven, which
+is a fact about the surgery. And contacts the placement policy has ruled out are
+left out, with a warning saying how many; see `Placement: what the policy did,
+and to what`_.
+
+Show the coverage beside the field
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`cortex.Electrode.coverage` is how much electrode there is at each vertex,
+in contacts -- about 1 under a lone contact, about 2 where two overlap, 0 where
+none reaches::
+
+    cortex.quickshow(elec.coverage(sigma=4, cmap="inferno"))
+
+It is worth showing next to any figure built from ``to_vertex``, because the
+field alone cannot distinguish cortex that six contacts agree about from cortex
+that one contact is speaking for at the far edge of its range. Both look like
+data. ``to_vertex`` returns NaN below ``min_weight`` of total weight, which
+renders as bare cortex, but that is a floor rather than an answer; the coverage
+map is the answer.
+
+Volumes, and the weights themselves
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`cortex.Electrode.to_volume` fills a voxel grid the same way, in true
+millimetres -- an anisotropic grid gives a blob that is round in the head rather
+than round in the array::
+
+    vol = elec.to_volume("fullhead", sigma=4)
+
+There is no surface in a voxel grid and so no metric to choose: a blob here
+crosses a sulcus, the pia and the fissure without noticing. When that matters,
+spread on the surface and project back with ``elec.to_vertex(sigma=4).volume("fullhead")``.
+
+Underneath all four methods is one sparse matrix, and it is public::
+
+    W = cortex.electrodes.surface_weights(elec.electrodes, sigma=4)
+
+``W[i, v]`` is how much contact ``i`` has to say about vertex ``v``. Row ``i`` is
+channel ``i``, always -- a contact that was left out gets an empty row rather
+than shifting every row beneath it -- so it multiplies a data array recorded on
+the same channels with no index bookkeeping. Every map above is a reduction of
+it: ``W.sum(0)`` is the coverage, ``(values @ W) / W.sum(0)`` the weighted mean.
+:func:`cortex.electrodes.volume_weights` is the same thing over voxels.
+
+A note on cost. The geodesic path solves a small heat problem per contact, which
+is roughly 35 ms on a native-resolution surface -- a couple of seconds for a
+clinical montage, and set by ``radius`` rather than by ``sigma``. Geodesic
+distance is itself approximate (the heat method of Crane et al. 2012, a few
+percent short on a millimetre mesh, in the direction of a slightly fat blob).
+That is well inside the uncertainty already carried by the choice of ``sigma``,
+and is not a reason to prefer euclidean: being a few percent wrong about a
+distance along cortex beats being exactly right about a distance through the skull.
+
+
 Montages in the filestore
 -------------------------
 

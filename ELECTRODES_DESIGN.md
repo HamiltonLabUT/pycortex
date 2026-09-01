@@ -593,6 +593,53 @@ An explicit rows-by-columns field on `ElectrodeSet` would retire the width
 search, and remains the obvious upgrade if a montage ever turns up that the
 recovery gets wrong. It is not needed to draw the montages we have.
 
+## 6.5 Spreading a contact's value over cortex
+
+`Electrode.to_vertex` turns a montage into a field: each contact's value smeared
+over the cortex around it as a Gaussian blob, the overlaps averaged, the result
+an ordinary `Vertex`. Two decisions in it are worth recording, because both look
+like fussiness until you see what the obvious version does.
+
+**Distance is measured along the surface, not through space.** The obvious
+version is a KD-tree over both hemispheres' vertices merged, and it is wrong in
+two places at once. The two banks of a sulcus are 3 mm apart through space and
+15 mm apart across cortex, so a subdural contact on a gyral crown paints the bank
+underneath it, which it is not recording from. And the two medial walls are
+closer than that, so a left-hemisphere contact paints the right hemisphere. The
+geodesic path costs about 35 ms per contact at the default radius -- measured on
+S1, a couple of seconds for a clinical montage -- and `metric="euclidean"` is
+kept as the fast, honestly-labelled alternative rather than as the default.
+
+Cost is set by `radius`, not by `sigma`. The implementation uses
+`Surface.get_geodesic_patch`, which solves on a subsurface around the seed, over
+`Surface.geodesic_distance` on the whole hemisphere. The whole-hemisphere route
+caches an LU factorization and is then radius-independent, which sounds better
+and is not: measured on S1 it costs 9.2 s of setup per hemisphere plus 144 ms per
+contact, against the patch route's zero setup and 35 ms, and the crossover is far
+above any radius this feature has a use for.
+
+There is one guard that is not optional. `Surface.geodesic_distance` fills its
+output with zeros and writes only the rows it solved, so a vertex the solve could
+not reach comes back at **distance zero, not infinity** -- and would take the
+full weight of every blob, anywhere on the hemisphere. Straight-line distance
+bounds geodesic distance from below, so the fix is to drop anything further than
+`radius` through space; it rejects nothing a correct solve would have kept.
+
+**No coordinate conversion is needed, in either direction.** The obvious version
+reads `orig.mgz`, builds `Norig @ inv(Torig)`, and shifts the contacts from
+TkRegRAS into scanner space. That is the right arithmetic for FreeSurfer and the
+wrong composition here, because `surface_space_offset` (§1.4) has already put the
+contacts into whatever space the subject's surfaces are actually in -- which is
+the question, and which the surfaces' own provenance answers without a
+`SUBJECTS_DIR` or an `mri_info` subprocess. The volumetric path needs nothing
+further either: a pycortex transform is defined against those same surfaces
+(`Mapper._cache` feeds raw `db.get_surf` points straight into `xfm(pts)`), so the
+offset that reaches the surfaces reaches the voxels too. Applying the `Torig`
+conversion on top would move every blob by `c_ras` -- 33 mm anterior on the
+bundled S1, where the surfaces declare `NIFTI_XFORM_UNKNOWN` and the offset is
+correctly zero. The test that pins this asserts a single contact's peak voxel
+against `xfm(coords + surface_space_offset(subject))`.
+
 ## 7. Still to settle
 
 Both of the questions this section opened with have since been answered, in

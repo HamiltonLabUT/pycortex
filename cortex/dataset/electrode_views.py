@@ -31,10 +31,14 @@ from ._electrode_space import NATIVE, ElectrodeSpace, resolve_montage
 from ._hdf import _hash
 from .view2D import Dataview2D, _resolve_2d_channels
 from .viewRGB import Color, Colors, DataviewRGB, _resolve_rgb_channels
-from .views import ElectrodeView, ScalarView
+from .views import ElectrodeView, ScalarView, Vertex, Volume
 
 if TYPE_CHECKING:
     from ..electrodes import ElectrodeSet
+    # Under TYPE_CHECKING only, like `ElectrodeSet` above: this module is
+    # imported while `cortex.dataset` is still initialising, and the blob
+    # functions themselves are imported inside the methods that call them.
+    from ..electrodes._blobs import Metric
 
 
 MARKER_SHAPES = ("sphere", "cube", "diamond")
@@ -520,6 +524,246 @@ class Electrode(ScalarView, ElectrodeView, _ElectrodeMarkers):
             marker_size=marker_size,
             marker_shape=marker_shape,
         )
+
+    # -- spreading the values over cortex --------------------------------
+
+    def to_vertex(
+        self,
+        sigma: float = 3.0,
+        radius: Optional[float] = None,
+        metric: "Metric" = "geodesic",
+        surface_type: str = "fiducial",
+        min_weight: float = 0.01,
+        placeable: bool = True,
+        **kwargs: Any,
+    ) -> "Vertex":
+        """These values as a field on the cortex, one Gaussian blob per contact.
+
+        Two hundred markers on a flatmap is two hundred markers; the question
+        usually being asked of them -- where is this effect, and how does it
+        compare with a surface or volumetric result from the same subject -- is
+        better answered by a field. Each contact's value is spread over the
+        cortex within a few millimetres of it and the overlaps are averaged, so
+        the montage becomes an ordinary :class:`Vertex`.
+
+        Parameters
+        ----------
+        sigma : float
+            Width of each blob, in millimetres. The knob that decides what the
+            picture looks like.
+        radius : float, optional
+            Cutoff in millimetres, three sigma by default. The knob that decides
+            what the call costs.
+        metric : {"geodesic", "euclidean"}
+            Whether distance is measured along the cortical surface or straight
+            through space. Geodesic keeps a blob off the far bank of a sulcus,
+            which is millimetres away through space and centimetres away across
+            cortex; euclidean is about ten times faster and is the one to reach
+            for on a first look at a large montage.
+        surface_type : str
+            Which surface to measure on. See
+            :func:`cortex.electrodes.surface_weights`.
+        min_weight : float
+            Vertices with less total weight than this come back NaN, and so
+            render as bare cortex. A vertex almost out of reach of every contact
+            has a mean that is one distant value carried further than it can
+            honestly go.
+        placeable : bool
+            Leave out contacts with no honest surface position.
+        **kwargs
+            Passed to :class:`Vertex`. ``cmap``, ``vmin`` and ``vmax`` default to
+            this view\'s own: a weighted mean with non-negative weights lies
+            between the smallest and largest value that fed it, so the contacts\'
+            bounds are exactly the field\'s bounds -- and the blobs then colour-match
+            the markers :func:`cortex.quickflat.add_electrodes` draws over them.
+
+        Returns
+        -------
+        Vertex
+            Over :attr:`subject`, and a movie if this view is one.
+
+        See Also
+        --------
+        coverage : how much electrode there is at each vertex, which is what says
+            whether a blob here means anything.
+        cortex.electrodes.surface_weights : the matrix underneath, if you want the
+            weights themselves.
+
+        Examples
+        --------
+        >>> elec = cortex.Electrode(values, "S1", "native")
+        >>> cortex.quickshow(elec.to_vertex(sigma=3))
+        """
+        from ..electrodes import surface_weights, weighted_mean
+
+        weights = surface_weights(
+            self.electrodes, sigma=sigma, radius=radius, metric=metric,
+            surface_type=surface_type, subject=self.subject, placeable=placeable,
+        )
+        self._warn_unreached(weights, "vertex")
+        for key, value in (("cmap", self.cmap), ("vmin", self.vmin), ("vmax", self.vmax)):
+            kwargs.setdefault(key, value)
+        return Vertex(weighted_mean(self.data, weights, min_weight), self.subject, **kwargs)
+
+    def coverage(
+        self,
+        sigma: float = 3.0,
+        radius: Optional[float] = None,
+        metric: "Metric" = "geodesic",
+        surface_type: str = "fiducial",
+        placeable: bool = True,
+        **kwargs: Any,
+    ) -> "Vertex":
+        """How much electrode there is at each vertex, in contacts.
+
+        The map that says where :meth:`to_vertex` is worth reading: about 1 under
+        a lone contact, about 2 where two of them overlap, 0 where none reaches.
+        A blob field on its own cannot distinguish cortex that several electrodes
+        agree about from cortex that one electrode is speaking for at the edge of
+        its range, and this is the map that can -- which is why a figure built
+        from :meth:`to_vertex` should usually be shown beside one built from here.
+
+        Takes the same geometry arguments as :meth:`to_vertex`, and depends only
+        on the montage: the values play no part.
+
+        Returns
+        -------
+        Vertex
+            Never a movie, and never NaN -- "no contact near here" is an answer,
+            and is drawn as zero rather than as a hole.
+        """
+        from ..electrodes import surface_weights, total_weight
+
+        weights = surface_weights(
+            self.electrodes, sigma=sigma, radius=radius, metric=metric,
+            surface_type=surface_type, subject=self.subject, placeable=placeable,
+        )
+        self._warn_unreached(weights, "vertex")
+        coverage = total_weight(weights)
+        self._coverage_bounds(coverage, kwargs)
+        return Vertex(coverage, self.subject, **kwargs)
+
+    def to_volume(
+        self,
+        xfmname: str,
+        sigma: float = 3.0,
+        radius: Optional[float] = None,
+        min_weight: float = 0.01,
+        placeable: bool = True,
+        mask: Optional[npt.NDArray] = None,
+        **kwargs: Any,
+    ) -> "Volume":
+        """These values as Gaussian blobs in a voxel grid.
+
+        The volumetric counterpart of :meth:`to_vertex`. There is no surface
+        here and so no choice of metric: distance is straight-line distance, and
+        a blob crosses a sulcus, the fissure and the pia without noticing. That
+        is the right answer when the comparison is with volumetric data, and the
+        wrong one when it is with cortex. For a volume that respects the folding,
+        spread on the surface and project back::
+
+            elec.to_vertex(sigma=3).volume(xfmname)
+
+        Parameters
+        ----------
+        xfmname : str
+            Which of the subject\'s transforms names the voxel grid to fill.
+        sigma, radius, min_weight, placeable
+            As in :meth:`to_vertex`, the distances in millimetres rather than
+            voxels -- an anisotropic grid gives a blob that is round in the head,
+            not round in the array.
+        mask : ndarray, optional
+            Boolean ``(z, y, x)`` over the transform\'s shape. Given one, the
+            result is a masked (linear) :class:`Volume`, which is both quicker
+            and tidier than filling skull and ventricle.
+        **kwargs
+            Passed to :class:`Volume`; ``cmap``, ``vmin`` and ``vmax`` default to
+            this view\'s own, as in :meth:`to_vertex`.
+        """
+        from ..electrodes import volume_weights, weighted_mean
+
+        weights = volume_weights(
+            self.electrodes, xfmname, sigma=sigma, radius=radius,
+            subject=self.subject, placeable=placeable, mask=mask,
+        )
+        self._warn_unreached(weights, "voxel")
+        for key, value in (("cmap", self.cmap), ("vmin", self.vmin), ("vmax", self.vmax)):
+            kwargs.setdefault(key, value)
+        data = weighted_mean(self.data, weights, min_weight)
+        return Volume(self._shape_volume(data, xfmname, mask), self.subject,
+                      xfmname, mask=mask, **kwargs)
+
+    def coverage_volume(
+        self,
+        xfmname: str,
+        sigma: float = 3.0,
+        radius: Optional[float] = None,
+        placeable: bool = True,
+        mask: Optional[npt.NDArray] = None,
+        **kwargs: Any,
+    ) -> "Volume":
+        """How much electrode there is at each voxel, in contacts.
+
+        :meth:`coverage` over a voxel grid; see it for what the numbers mean.
+        """
+        from ..electrodes import total_weight, volume_weights
+
+        weights = volume_weights(
+            self.electrodes, xfmname, sigma=sigma, radius=radius,
+            subject=self.subject, placeable=placeable, mask=mask,
+        )
+        self._warn_unreached(weights, "voxel")
+        coverage = self._shape_volume(total_weight(weights), xfmname, mask)
+        self._coverage_bounds(coverage, kwargs)
+        return Volume(coverage, self.subject, xfmname, mask=mask, **kwargs)
+
+    @staticmethod
+    def _coverage_bounds(data, kwargs) -> None:
+        """Give a coverage map bounds that make it readable.
+
+        Not left to :class:`~cortex.dataset.views.ScalarView`\'s percentile
+        defaults, which are wrong here in a way that is easy to miss: a coverage
+        map is mostly zero -- an implanted region is a few percent of a
+        hemisphere -- so the 99th percentile lands near the bottom of the range,
+        every covered vertex saturates to one colour, and a density is drawn as a
+        mask. The full range is the honest default for a quantity that has a real
+        zero and no natural ceiling.
+        """
+        peak = float(np.nanmax(data)) if data.size else 0.0
+        kwargs.setdefault("vmin", 0)
+        kwargs.setdefault("vmax", peak if peak > 0 else 1.0)
+
+    def _shape_volume(self, data, xfmname, mask):
+        """Give the voxel axis the shape :class:`Volume` reads it in.
+
+        Masked data stays flat -- that is the layout the mask branch of
+        ``VolumeSpace.coerce`` expects. Unmasked data is folded back into
+        ``(z, y, x)``, keeping any movie axis in front of it.
+        """
+        if mask is not None:
+            return data
+        from ..database import db
+
+        return data.reshape(data.shape[:-1] + tuple(db.get_xfm(self.subject, xfmname).shape))
+
+    def _warn_unreached(self, weights, noun: str) -> None:
+        """Say so when a contact reached nothing, rather than dropping it quietly.
+
+        A contact with an empty row took no part in the field. Usually the
+        placement policy ruled it out -- a placeholder row for an unconnected
+        amplifier channel, a contact in the deep white-matter core -- and that is
+        exactly the sort of thing to say out loud once, rather than leave someone
+        to infer from a hole in a figure.
+        """
+        import warnings
+
+        silent = int((np.asarray(weights.sum(axis=1)).ravel() == 0).sum())
+        if silent:
+            warnings.warn(
+                "%d of %d contacts reached no %s and are not in this field"
+                % (silent, self.n_electrodes, noun),
+                stacklevel=3,
+            )
 
     # -- construction helpers -------------------------------------------
 
