@@ -83,7 +83,13 @@ def build_shaft(subject=SUBJECT, n=15, pitch=4.0):
         group=["LTD"] * n,
         group_type=["seeg"] * n,
     )
-    eset.anchor()
+    # Explicitly the shared-frame mode, which is what this fixture's tests are
+    # about. It is no longer what `auto` does: a rigid device keeps its shape and
+    # floats off the anatomy, so `auto` now chooses a shank's anchors jointly
+    # instead. `coherent=False` too, so the rigid geometry asserted downstream is
+    # measured against the anchors the coordinates imply rather than against
+    # re-chosen ones.
+    eset.anchor(anchor_mode="per_device", coherent=False)
     return eset
 
 

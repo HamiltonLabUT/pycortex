@@ -453,6 +453,10 @@ Each phase is independently verifiable and independently useful.
   rather than projected onto it. `evaluate(offset="frame")` in python and an
   `offsets` toggle in the viewer. Not in the original phasing; §7 is why it
   turned out to be necessary.
+- **P3e** — *done.* Coherent anchoring: a shank's anchors chosen jointly rather
+  than one contact at a time. §8 records the measurements, including the dual
+  optimisation that was implemented, measured and rejected. This also demoted
+  P3d's shared frame from the `auto` default to an explicit option.
 - **P4** — billboards for STRF and evoked data. Not started.
 
 ## 3. Decisions taken
@@ -684,13 +688,21 @@ shaft, because the anchor is what moved. So a device may share one frame:
   smallest `offset_mm` (best explained by its column). Deliberately *not* the
   shallowest: `depth` is untrustworthy for exactly the contacts this exists to
   fix.
-- `auto` — `per_device` for `seeg`/`depth`, `per_contact` otherwise, keyed on
-  `group_type`, mirroring `MARKER_BY_GROUP_TYPE`.
+- `auto` — at the time this was written, `per_device` for `seeg`/`depth` and
+  `per_contact` otherwise, keyed on `group_type`. **Superseded by §8**: a rigid
+  device floats off the anatomy, so `auto` now shares no frames at all and
+  routes shanks to coherent anchoring instead. `per_device` remains as an
+  explicit request.
 
 A device never spans hemispheres; contacts group by `(group, hemi)` so a
 bilateral or mislabelled group splits rather than anchoring across the midline.
 
 ### `group_type` is usually not there, and the geometry can stand in
+
+*(This subsection's routing now lives in `_coherent.py` rather than in
+`regroup_anchors`, per §8, and was tightened there: straightness is required
+whatever the label, not only when the label is missing. The measurements below
+are what both versions rest on.)*
 
 Keying `auto` on `group_type` alone was nearly a silent failure. Of the three
 clinical montages in this filestore, **two record no `group_type` at all** — and
@@ -777,7 +789,118 @@ confident-looking wrong numbers:
 `offset="none"` remains the default everywhere, so nothing that does not ask for
 this changes.
 
-## 8. Still to settle
+## 8. The tearing is in the anchor, not in the drawing
+
+P3d gave a depth electrode one rigid frame, which fixed its spacing and broke
+something else. Measured on `S0033_complete`'s `ASP-aPC` — 16 contacts, native
+pitch 3.37 mm, sitting **2.34 mm** from the pial surface:
+
+| | pitch | pitch spread | distance from inflated surface | moved vs projection |
+| --- | --- | --- | --- | --- |
+| projection | 2.41 | 44.13 | 0.04 | 0 |
+| rigid frame | 3.91 | 0.02 | **8.39** | **77.5** |
+
+A perfect shape, floating up to 77 mm from where the anatomy says it belongs. So
+`auto` no longer routes `seeg`/`depth` to a shared frame; that is now an explicit
+`anchor_mode="per_device"`, for when a device's true trajectory is what you want.
+
+### The dual optimisation, implemented and rejected
+
+The obvious middle ground is to minimise both the change in contact-to-contact
+spacing and the change in each contact's distance to its nearest surface
+vertices — a stress function with fixed anchors, the object SMACOF minimises. It
+was implemented and run on real devices. Four measured reasons it is the wrong
+tool:
+
+1. **Distance-to-nearest-vertices barely encodes depth.** It is 0.7–6.5 mm for
+   *every* contact in S0033 and 0.8–14.5 mm in TCH06 regardless of how deep the
+   contact is, because cortex folds densely enough that nothing is ever far from
+   some bank. The term says "stay near cortex", which is nearly what projection
+   says. It cannot express "40 mm inside the brain".
+2. **The five nearest vertices straddle sulcal banks ~10% of the time**, flying
+   25.7 mm (TCH06) to 44.1 mm (S0033) apart when inflated, ratios to 22×. For
+   11.9% of contacts the constraints are mutually **unsatisfiable**: best
+   residual 2.6 mm, reaching 15.2 mm against target distances of ~2.6 mm. This
+   is §7's sulcal discontinuity reappearing inside the objective.
+3. **The compromise measured worse than either endpoint.** On `ASP-aPC` at 1:1,
+   median pitch 5.66 against a true 3.37 and spread still 13 mm. There is no
+   weighting that gets both: by the time the pitch is clean the contacts are
+   10 mm off the sheet anyway. λ has no natural units, and *k* is a second free
+   parameter the answer moves with.
+4. **At 14.7% of consecutive pairs the goals are genuinely contradictory** —
+   anchors land >3× native spacing apart, to 13× and 77 mm. A least-squares
+   compromise resolves that by putting *both* contacts between the two gyri,
+   over anatomy belonging to neither.
+
+### What works: choose the anchor, not the position
+
+The tearing is not about where contacts are drawn. It is about **which column
+each is assigned to**, decided independently by a search that does not know a
+device is a device. And that choice is a near-tie. Among the ~50 nearest
+candidate columns for a real contact:
+
+| | |
+| --- | --- |
+| distance to the best column | p50 0.40 mm, p90 2.45 mm |
+| extra cost of the fiftieth-best | p50 1.34 mm, p90 1.79 mm |
+
+A contact can be reassigned among fifty columns for about a millimetre of native
+fidelity, while that reassignment moves it up to 77 mm on the inflated surface.
+Tiny cost, enormous effect — exactly where choosing jointly beats choosing
+greedily. `_coherent.py` does it by Viterbi along each shank: unary cost is
+distance to the column, pairwise cost is the mismatch between inflated gap and
+native spacing, both in millimetres so the weight is a ratio.
+
+### Two caps, and the first one is not enough
+
+`MAX_FIDELITY_LOSS_MM = 2.0` bounds how much *further from the contact* a column
+may be. That does **not** bound how far away it is on the sheet: two columns can
+each sit 2 mm from a contact and 9 mm from each other, on opposite banks or at
+different depths of one sulcus. With only that cap, anchors moved up to 9.5 mm
+and 4.7% moved more than 5 mm — far enough to cross a gyral crown.
+
+So `MAX_ANCHOR_SHIFT_MM = 3.0` caps the displacement of the anchor point
+directly, and is measured **from the anchor ordinary anchoring chose**, not from
+the solver's own best candidate. Those differ: the wider neighbourhood used here
+sometimes finds a genuinely closer column, and a cap measured from that would let
+a contact drift while reporting it had not moved. The incumbent is injected as a
+candidate rather than trusted to appear in the search, which is what turns the
+cap from a tendency into a guarantee — measured worst shift 2.96 and 2.99 mm
+against the 3 mm cap.
+
+### What it buys, and what it cannot
+
+| | S0033 | TCH06 |
+| --- | --- | --- |
+| median spacing error | 1.18 → **0.13** mm | 1.69 → **0.28** mm |
+| torn pairs (>3× spacing) | 14.7% → 11.7% | 14.2% → 13.0% |
+| worst anchor shift | 2.96 mm | 2.99 mm |
+
+The remaining tears are anatomy, not error. On one device a 45 mm jump reduces
+only to 42.5 mm with an eighty-neighbour candidate set and **no cap at all**:
+those two contacts genuinely belong to gyri that inflation separates, and no
+choice of anchor closes it. `CoherenceReport` reports them rather than smoothing
+them away.
+
+Three things worth keeping:
+
+- **Label and geometry must both agree.** A `grid`/`strip` label excludes
+  outright; straightness is then required whatever the label, including an
+  explicit `seeg`. Real shanks are rigid needles and pass by an order of
+  magnitude. What this rejects is a scattered group that merely shares a name —
+  found when a quickflat fixture of scattered contacts labelled `seeg` had its
+  depths quietly moved.
+- **Derived quantities must be recomputed.** `depth`, `depth_mm`,
+  `thickness_mm` and `offset_mm` are statements *about a column*, so
+  re-anchoring invalidates all of them, and `placement` must be reclassified.
+  `dist_pia_mm` / `dist_wm_mm` deliberately are **not**: they ask how far the
+  contact is from any cortex, which re-anchoring must not be able to change —
+  and indeed the `too_far` counts are identical before and after.
+- **`column_costs` is shared.** The DP ranks candidates by exactly the measure
+  ordinary anchoring picks its winner by. Two copies of that arithmetic drifting
+  apart would be invisible: both would still return a plausible anchor.
+
+## 9. Still to settle
 
 Both of the questions this section opened with have since been answered, in
 the course of P1 and P3. Recorded here rather than deleted, because the answers

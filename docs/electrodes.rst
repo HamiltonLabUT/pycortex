@@ -183,6 +183,54 @@ which shifts the hemispheres apart for every surface but the fiducial. Anchoring
 itself always happens un-nudged.
 
 
+Depth electrodes and the sulcus problem
+---------------------------------------
+
+Anchoring picks, for each contact independently, the cortical column nearest it.
+For a grid that is right. For a depth electrode it is what tears the montage
+apart on an inflated surface: a shank threads folds, consecutive contacts sit
+near *opposite banks* of the same sulcus, and each independently picks whichever
+bank is half a millimetre closer. In native space that looks harmless -- both
+banks really are adjacent -- and inflation then pulls them centimetres apart.
+
+Measured across two real clinical montages, 14% of consecutive pairs end up more
+than three times their native spacing apart, reaching thirteen times.
+
+``anchor()`` therefore chooses each shank's anchors **together**, by dynamic
+programming along the shank, balancing how near each contact is to its column
+against how far consecutive anchors drift apart once inflated::
+
+    eset.anchor()                       # on by default
+    print(eset.coherence.summary())
+    eset.anchor(coherent=False)         # the independent choice
+
+Two hard caps make this safe rather than merely better. A candidate column is
+rejected if it is more than
+:data:`~cortex.electrodes.MAX_FIDELITY_LOSS_MM` further from the contact than the
+best available, **and** if its anchor point sits more than
+:data:`~cortex.electrodes.MAX_ANCHOR_SHIFT_MM` from the anchor ordinary anchoring
+would have chosen. The second is the one that matters for anatomy: two columns
+can each be 2 mm from a contact and 9 mm from each other, on opposite banks of
+one sulcus. Rejected candidates are removed from the search entirely, so no
+weighting can reach them -- measured worst displacement is 2.96 mm against a 3 mm
+cap, which is why contacts stay on the gyrus they started on.
+
+What it buys, on the two real montages: median spacing error on the inflated
+surface improves from 1.18 to 0.13 mm and from 1.69 to 0.28 mm.
+
+What it cannot do is remove the tears where the anatomy genuinely separates.
+Where two consecutive contacts really do belong to gyri that inflation moves
+apart, no anchor within the cap closes the gap -- on one device a 45 mm jump
+reduces only to 42.5 mm with no cap at all. Those breaks are anatomy rather than
+error, and ``eset.coherence`` reports them instead of hiding them.
+
+Only rigid shanks are touched. A ``grid`` or ``strip`` label excludes a device
+outright, and a device that is not geometrically straight is excluded whatever
+its label says -- a real shank is a rigid needle and passes easily, while a group
+of scattered contacts that merely share a name is not something the model
+describes.
+
+
 On the surface, or off it
 -------------------------
 
@@ -209,9 +257,13 @@ No individual contact looks wrong -- projection moves none of them more than
 ever far from *some* bank. The damage is entirely in the relative geometry, so
 per-contact checks cannot see it.
 
-Devices are grouped automatically by ``group_type``: ``seeg`` and ``depth``
-groups share one frame and stay rigid, everything else keeps a frame per contact
-and drapes over the folds.
+Devices keep a frame per contact by default. ``anchor_mode="per_device"`` gives
+a whole shank one shared frame instead, which preserves its shape and entry angle
+exactly -- useful for reading a trajectory, and *not* the default, because a
+rigid device floats away from the anatomy: measured on a real montage, contacts
+2.3 mm from the pial surface were drawn 8.4 mm off the inflated sheet and up to
+77 mm from their projection. The tearing that motivates a shared frame is better
+handled by coherent anchoring, above.
 
 Many montages record no ``group_type`` at all, so where it is missing the
 grouping falls back to the geometry -- a depth electrode is a rigid needle and

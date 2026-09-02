@@ -29,7 +29,6 @@ from cortex.electrodes import (
     SCALE_SIMILARITY,
     anchor_to_surfaces,
     frame_components,
-    is_straight,
     regroup_anchors,
 )
 from cortex.electrodes._anchor import _triangle_basis
@@ -233,110 +232,26 @@ def test_a_shared_frame_keeps_a_device_rigid_on_a_stretched_surface(hemis):
     assert np.abs(shared.evaluate(surfaces, offset=OFFSET_FRAME) - coords).max() < EXACT
 
 
-def test_auto_shares_a_shaft_and_leaves_a_grid_alone(hemis):
-    coords = np.vstack([
-        shaft([-20.0, -6.0, 1.0], [0.0, 1.0, -0.8]),
-        np.column_stack([
-            np.full(9, -16.0) + np.tile([0.0, 2.0, 4.0], 3),
-            np.repeat([-2.0, 0.0, 2.0], 3),
-            np.full(9, 1.5),
-        ]),
-    ])
-    groups = ["LTD"] * 8 + ["LG"] * 9
-    types = ["seeg"] * 8 + ["grid"] * 9
-    anchors = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis), groups, types
-    )
-    assert len(np.unique(anchors.hosts[:8])) == 1       # the shaft is one body
-    assert len(np.unique(anchors.hosts[8:])) == 9       # every grid contact its own
+def test_auto_no_longer_shares_frames(hemis):
+    """``auto`` used to route seeg/depth to a shared frame. It no longer does.
 
-
-def test_straightness_separates_a_shaft_from_a_draped_device():
-    """The geometric fallback, on the shapes it has to tell apart."""
-    straight = shaft([0.0, 0.0, 0.0], [0.0, 1.0, -0.8], n=10)
-    assert is_straight(straight)
-    # Real localisation is not exact; a shaft jittered by half a millimetre is
-    # still a shaft. The measured worst case over three clinical montages was
-    # 0.95 mm.
-    jittered = straight + np.array([
-        [0.4, -0.3, 0.5], [-0.5, 0.2, -0.4], [0.3, 0.5, 0.2], [-0.2, -0.5, 0.3],
-        [0.5, 0.3, -0.5], [-0.4, -0.2, 0.4], [0.2, 0.4, -0.3], [-0.3, 0.5, 0.2],
-        [0.5, -0.4, -0.2], [-0.5, 0.3, 0.5],
-    ])
-    assert is_straight(jittered)
-
-    # A grid is not a line at all.
-    grid = np.array([[x * 5.0, y * 5.0, 0.0] for x in range(4) for y in range(4)])
-    assert not is_straight(grid)
-
-    # Nor is a strip that follows the convexity it lies on: linear, but bent.
-    angle = np.linspace(-0.6, 0.6, 8)
-    strip = np.column_stack([40 * np.sin(angle), 40 * np.cos(angle), np.zeros(8)])
-    assert not is_straight(strip)
-
-
-def test_two_contacts_are_not_evidence_of_a_device():
-    """Any two points are collinear, so a pair must not claim to be a shaft."""
-    assert not is_straight(np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]]))
-    assert not is_straight(np.zeros((0, 3)))
-    # Non-finite rows are excluded before the fit rather than poisoning it.
-    with_nan = np.array([[0.0, 0.0, 0.0], [np.nan] * 3, [0.0, 4.0, 0.0]])
-    assert not is_straight(with_nan)              # two usable points is still two
-
-
-def test_an_unlabelled_shaft_is_grouped_from_its_geometry(hemis):
-    """Two of the three real montages in this filestore carry no group type.
-
-    Every one of TCH06's twenty-one groups is a depth electrode, and without
-    this fallback all 186 of its contacts got per-contact anchoring -- silently,
-    and for no better reason than a missing column.
+    A rigid device keeps its shape and floats away from the anatomy -- measured
+    on a real montage, contacts 2.3 mm from the pial surface were drawn 8.4 mm
+    off the inflated sheet and up to 77 mm from their projection, over whatever
+    happened to be underneath. The tearing that motivated a shared frame is now
+    addressed at its cause, by choosing a shank's anchors jointly
+    (:mod:`cortex.electrodes._coherent`), which cannot move a contact off its own
+    cortex. A shared frame is still available, and is now an explicit request.
     """
-    coords = shaft([-20.0, -6.0, 1.0], [0.0, 1.0, -0.8], n=8)
-    anchors = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LTD"] * 8, group_types=[""] * 8,
-    )
-    assert len(np.unique(anchors.hosts)) == 1
+    coords = shaft([-20.0, -6.0, 1.0], [0.0, 1.0, -0.8])
+    args = (coords, pia_of(hemis), ["LTD"] * 8, ["seeg"] * 8)
+    auto = regroup_anchors(anchor_to_surfaces(coords, hemis), *args)
+    assert len(np.unique(auto.hosts)) == 8          # each its own
 
-    # Passing no group_types at all takes the same path.
-    again = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis), ["LTD"] * 8
-    )
-    assert len(np.unique(again.hosts)) == 1
-
-
-def test_an_unlabelled_grid_is_left_alone(hemis):
-    coords = np.array([
-        [-16.0 + i * 3.0, -3.0 + j * 3.0, 1.5] for i in range(4) for j in range(4)
-    ])
-    anchors = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LG"] * 16, group_types=[""] * 16,
-    )
-    assert len(np.unique(anchors.hosts)) == 16
-
-
-def test_an_explicit_label_beats_the_geometry(hemis):
-    """A montage that says "grid" is believed even if it happens to be straight.
-
-    A 1xN grid is a legal thing to record, and guessing against a column the
-    montage actually filled in would be overreach -- the fallback exists for
-    the missing case, not to second-guess the stated one.
-    """
-    coords = shaft([-20.0, -6.0, 1.0], [0.0, 1.0, -0.8], n=8)
-    assert is_straight(coords)
-    anchors = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LG"] * 8, group_types=["grid"] * 8,
-    )
-    assert len(np.unique(anchors.hosts)) == 8
-
-    # And per_device still overrides, for a caller who knows better.
     forced = regroup_anchors(
-        anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LG"] * 8, group_types=["grid"] * 8, mode=ANCHOR_PER_DEVICE,
+        anchor_to_surfaces(coords, hemis), *args, mode=ANCHOR_PER_DEVICE
     )
-    assert len(np.unique(forced.hosts)) == 1
+    assert len(np.unique(forced.hosts)) == 1        # still available
 
 
 def test_per_contact_leaves_the_anchors_untouched(hemis):
@@ -362,7 +277,7 @@ def test_a_device_never_spans_hemispheres(hemis):
     ])
     anchors = regroup_anchors(
         anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["TD"] * 8, ["seeg"] * 8,
+        ["TD"] * 8, ["seeg"] * 8, mode=ANCHOR_PER_DEVICE,
     )
     hosts = anchors.hosts
     assert len(np.unique(hosts)) == 2
@@ -381,7 +296,7 @@ def test_a_missing_coordinate_is_not_placed_by_its_neighbours(hemis):
     coords[3] = np.nan
     anchors = regroup_anchors(
         anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LTD"] * 6, ["seeg"] * 6,
+        ["LTD"] * 6, ["seeg"] * 6, mode=ANCHOR_PER_DEVICE,
     )
     assert anchors.placement[3] == NO_COORDINATE
     assert anchors.hosts[3] == 3
@@ -402,6 +317,7 @@ def test_selecting_a_whole_device_keeps_it_rigid(hemis):
     anchors = regroup_anchors(
         anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
         ["LTD"] * 4 + ["LG"] * 2, ["seeg"] * 4 + ["grid"] * 2,
+        mode=ANCHOR_PER_DEVICE,
     )
     sub = anchors[np.array([0, 1, 2, 3])]
     assert len(np.unique(sub.hosts)) == 1
@@ -421,7 +337,7 @@ def test_selecting_away_the_frames_host_falls_back_to_self_anchoring(hemis):
     coords = shaft([-20.0, -6.0, 1.0], [0.0, 1.0, -0.8], n=5)
     anchors = regroup_anchors(
         anchor_to_surfaces(coords, hemis), coords, pia_of(hemis),
-        ["LTD"] * 5, ["seeg"] * 5,
+        ["LTD"] * 5, ["seeg"] * 5, mode=ANCHOR_PER_DEVICE,
     )
     host = int(anchors.hosts[0])
     keep = np.array([i for i in range(5) if i != host])
