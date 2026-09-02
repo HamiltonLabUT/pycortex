@@ -64,6 +64,14 @@ from ._anchor import (
     regroup_anchors,
     surface_hash,
 )
+from ._coherent import (
+    COHERENCE_WEIGHT,
+    MAX_ANCHOR_SHIFT_MM,
+    MAX_FIDELITY_LOSS_MM,
+    CoherenceReport,
+    coherent_anchors,
+    solve_device,
+)
 from ._io import (
     check_hemispheres,
     from_dict,
@@ -112,6 +120,13 @@ __all__ = [
     "TOO_FAR",
     "UNKNOWN_ANATOMY",
     "PLACEMENTS",
+    # choosing a shank's anchors together rather than one contact at a time
+    "coherent_anchors",
+    "solve_device",
+    "CoherenceReport",
+    "MAX_FIDELITY_LOSS_MM",
+    "MAX_ANCHOR_SHIFT_MM",
+    "COHERENCE_WEIGHT",
     # keeping an electrode off the surface it is anchored to
     "frame_components",
     "regroup_anchors",

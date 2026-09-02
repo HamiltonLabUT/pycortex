@@ -20,6 +20,7 @@ from typing import Any, Iterator, Mapping, NamedTuple, Optional, Sequence, Union
 import numpy as np
 import numpy.typing as npt
 
+from ._coherent import coherent_anchors
 from ._anchor import (
     ANCHOR_AUTO,
     HEMIS,
@@ -29,6 +30,7 @@ from ._anchor import (
     PlacementPolicy,
     SurfacePair,
     anchor_to_surfaces,
+    NO_COORDINATE,
     classify_placement,
     regroup_anchors,
 )
@@ -231,6 +233,11 @@ class ElectrodeSet:
                 % (len(anchors), n)
             )
         self.anchors = anchors
+        #: What :meth:`anchor` did when choosing shank anchors jointly, or None.
+        #: Carries the count of devices touched, the worst fidelity loss, and --
+        #: the honest half -- how many consecutive pairs anatomy tore apart
+        #: anyway. See :class:`~cortex.electrodes._coherent.CoherenceReport`.
+        self.coherence = None
 
     # -- basics ---------------------------------------------------------
 
@@ -414,6 +421,8 @@ class ElectrodeSet:
         policy: Optional[PlacementPolicy] = None,
         surfaces: Optional[Mapping[str, SurfacePair]] = None,
         anchor_mode: str = ANCHOR_AUTO,
+        coherent: bool = True,
+        inflated_surfaces: Optional[Mapping[str, npt.NDArray[np.floating]]] = None,
         inplace: bool = True,
     ) -> ElectrodeAnchors:
         """Compute this set's surface anchors, loading the surfaces if needed.
@@ -429,6 +438,21 @@ class ElectrodeSet:
             pycortex does not hold. Taken to be in the same space as
             :attr:`coords`, so no offset is applied: passing surfaces means
             taking responsibility for the frame they are in.
+        coherent : bool
+            Choose each rigid shank's anchors jointly rather than one contact at
+            a time, so consecutive contacts stop alternating between the two
+            banks of a sulcus. On by default; it only touches ``seeg``/``depth``
+            devices and devices whose geometry says they are shanks, and it never
+            moves a contact more than
+            :data:`~cortex.electrodes._coherent.MAX_FIDELITY_LOSS_MM` further
+            from cortex than its best available column. See
+            :attr:`coherence` for what it did.
+
+            Needs the subject's inflated surface, which is what the coherence is
+            measured on. Silently skipped for a subject that has none.
+        inflated_surfaces : mapping, optional
+            ``{"lh": pts, "rh": pts}``, un-nudged. Loaded from the subject when
+            not given, and required alongside an explicit ``surfaces``.
         anchor_mode : {"auto", "per_contact", "per_device"}
             Whether a device's contacts share one frame. :data:`ANCHOR_AUTO`
             shares it for ``seeg`` and ``depth`` groups and not for the rest,
@@ -467,6 +491,30 @@ class ElectrodeSet:
         anchors = anchor_to_surfaces(
             coords, surfaces, policy=policy, anatomy=self.anatomy
         )
+
+        # Choose each shank's anchors together before anything else reads them.
+        # This changes `verts` and `weights`, so it has to happen before the
+        # frames are measured against them, and before any placement decision
+        # that depends on which column a contact was assigned to.
+        self.coherence = None
+        if coherent:
+            inflated = inflated_surfaces
+            if inflated is None:
+                inflated = _load_inflated(subject or self.subject, surfaces)
+            if inflated:
+                anchors, self.coherence = coherent_anchors(
+                    anchors, coords, surfaces, inflated,
+                    groups=self.group, group_types=self.group_type,
+                )
+                # `depth` decides on_surface vs projected, and re-anchoring
+                # changed it. Reclassifying here rather than leaving the old
+                # verdict, which would describe a column the contact is no
+                # longer anchored to.
+                anchors.placement = classify_placement(
+                    anchors, policy, self.anatomy
+                )
+                anchors.placement[~np.isfinite(coords).all(axis=1)] = NO_COORDINATE
+
         anchors = regroup_anchors(
             anchors,
             coords,
@@ -529,6 +577,30 @@ class ElectrodeSet:
         return self.anchors.evaluate(
             {"lh": left[0], "rh": right[0]}, offset=offset, scale_mode=scale_mode
         )
+
+
+def _load_inflated(
+    subject: Optional[str], surfaces: Mapping[str, SurfacePair]
+) -> dict[str, npt.NDArray[np.floating]]:
+    """The subject's inflated surface, un-nudged, for the coherence term.
+
+    Un-nudged for the same reason anchoring is: nudging shifts a hemisphere in x
+    for display, and a coherence measured across that shift would be measuring
+    the display offset. Returns an empty mapping rather than raising when the
+    subject has no inflated surface -- coherent anchoring is then skipped and
+    ordinary anchoring stands, which is a worse picture but not a broken one.
+    """
+    if subject is None:
+        return {}
+    from ..database import db
+
+    out = {}
+    for hemi in surfaces:
+        try:
+            out[hemi] = db.get_surf(subject, "inflated", hemi, nudge=False)[0]
+        except Exception:
+            return {}
+    return out
 
 
 #: GIFTI's code for "these coordinates are in the scanner's frame"

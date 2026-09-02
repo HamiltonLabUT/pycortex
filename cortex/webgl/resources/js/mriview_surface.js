@@ -105,6 +105,8 @@ var mriview = (function(module) {
             colorbar: {action:[this, "toggleColorbar"]},
             opacity: {action:[this.uniforms.dataAlpha, "value", 0, 1]},
             surface_opacity: {action:[this, "setSurfaceAlpha", 0, 1]},
+            depth_write: {action:[this, "setDepthWrite"]},
+            xray: {action:[this, "setXray"]},
             ghostiness: {action:[this, "setFresnelPower", 0.5, 6]},
             toggleOpacity: {action: this.toggleOpacity.bind(this), key: 'o', hidden: true, help:'Toggle data opacity'},
             left: {action:[this, "setLeftVis"]},
@@ -472,11 +474,54 @@ var mriview = (function(module) {
     module.Surface.prototype._applySurfaceAlpha = function(shader) {
         var alpha = this.uniforms.surfaceAlpha.value;
         var transparent = alpha < 1;
-        if (shader.transparent === transparent)
+        var write = !transparent || this._depthWrite;
+        if (shader.transparent === transparent && shader.depthWrite === write)
             return;                     // nothing to recompile
         shader.transparent = transparent;
-        shader.depthWrite = !transparent;
+        shader.depthWrite = write;
         shader.needsUpdate = true;
+    };
+
+    // Keep the surface writing depth even while it is see-through.
+    //
+    // Off by default, because switching it on is a real trade rather than a
+    // strict improvement: with depth-writing the far bank can no longer draw
+    // *over* the near one, which is the ugly half of the shimmer, but whether
+    // the far bank contributes at all still depends on the order 230,000
+    // triangles happen to be drawn in. WebGL cannot sort within a mesh, so
+    // transparency here is order-dependent either way -- this bounds the
+    // disorder rather than removing it, and costs some of the see-through.
+    //
+    // The markers are unaffected: they are separate materials and their
+    // visibility through cortex is `depthTest`, not `depthWrite`. So an opaque,
+    // properly-ordered surface with contacts still showing through it is
+    // depth_write on plus xray on, which is what this exists to make reachable.
+    module.Surface.prototype.setDepthWrite = function(val) {
+        if (val === undefined)
+            return !!this._depthWrite;
+        this._depthWrite = !!val;
+        for (var name in this.shaders)
+            this._applySurfaceAlpha(this.shaders[name]);
+        this.dispatchEvent({type:"update"});
+    };
+
+    // Draw the markers whatever is in front of them, independently of how
+    // see-through the surface is.
+    //
+    // These were one control: `setSurfaceAlpha` drove `setXray` off
+    // `alpha < 1`, so seeing a contact inside the brain meant making the
+    // cortex transparent, and making the cortex transparent meant losing
+    // depth-writing and gaining the shimmer. Three things chained to one
+    // slider. They are separate questions -- how see-through is the surface,
+    // does it order itself, do the markers ignore it -- and are now separate
+    // controls.
+    module.Surface.prototype.setXray = function(val) {
+        if (val === undefined)
+            return this.electrodes !== undefined && this.electrodes.setXray();
+        this._xray = !!val;
+        if (this.electrodes !== undefined)
+            this.electrodes.setXray(this._xray);
+        this.dispatchEvent({type:"update"});
     };
 
     module.Surface.prototype.setSurfaceAlpha = function(val) {
@@ -488,7 +533,10 @@ var mriview = (function(module) {
         // Markers stop depth-testing once the hull is see-through, so a contact
         // behind cortex is drawn rather than culled. Near and far contacts then
         // look alike, which is the trade an x-ray view is asking for.
-        if (this.electrodes !== undefined)
+        // Only while nobody has said otherwise: an explicit `xray` setting is a
+        // statement about the markers and must not be undone by moving the
+        // opacity slider.
+        if (this.electrodes !== undefined && this._xray === undefined)
             this.electrodes.setXray(val < 1);
         this.dispatchEvent({type:"update"});
     };

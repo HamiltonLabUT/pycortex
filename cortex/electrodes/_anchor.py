@@ -144,8 +144,20 @@ nearest them -- a depth electrode threads folds, so per-contact anchoring makes
 consecutive contacts hop between banks."""
 
 ANCHOR_AUTO = "auto"
-""":data:`ANCHOR_PER_DEVICE` for ``seeg`` and ``depth``, :data:`ANCHOR_PER_CONTACT`
-for everything else, keyed on the group type."""
+""":data:`ANCHOR_PER_CONTACT` for every device.
+
+It used to route ``seeg`` and ``depth`` to :data:`ANCHOR_PER_DEVICE`, and that
+was the wrong default. A rigid device keeps its shape perfectly and floats away
+from the anatomy: measured on ``S0033_complete``'s ``ASP-aPC``, contacts that sit
+2.3 mm from the pial surface were drawn 8.4 mm off the inflated sheet and up to
+77 mm from where projection put them -- over whatever happened to be underneath,
+rather than over their own gyrus.
+
+The tearing that motivated a shared frame is better addressed where it comes
+from: :mod:`cortex.electrodes._coherent` chooses a shank's anchors jointly, which
+fixes the cause instead of overriding the result, and cannot move a contact off
+its own cortex. So a shared frame is now an explicit request, for when a device's
+true trajectory and shape are what you want to see."""
 
 ANCHOR_MODES = (ANCHOR_AUTO, ANCHOR_PER_CONTACT, ANCHOR_PER_DEVICE)
 
@@ -750,17 +762,9 @@ def _anchor_one_hemisphere(
             to_pia[i] = dist[best]
             continue
 
-        pial_point = np.einsum("fij,fi->fj", pia[tri], w)
-        column = np.einsum("fij,fi->fj", wm[tri], w) - pial_point
-        length2 = np.einsum("fi,fi->f", column, column)
-        rel = coords[i] - pial_point
-        with np.errstate(invalid="ignore", divide="ignore"):
-            t = np.einsum("fi,fi->f", rel, column) / length2
-        t = np.where(length2 > 0, t, 0.0)
-
-        # Distance to the slab: perpendicular within the ribbon, and to the
-        # nearer face of it outside.
-        to_segment = np.linalg.norm(rel - np.clip(t, 0.0, 1.0)[:, None] * column, axis=1)
+        to_segment, t, length2, rel, column = column_costs(
+            coords[i], tri, pia, wm, w
+        )
         best = int(np.argmin(to_segment))
 
         face[i] = cand[best]
@@ -791,6 +795,44 @@ def _anchor_one_hemisphere(
         dist_pia_mm=to_pia,
         dist_wm_mm=to_wm,
     )
+
+
+def column_costs(
+    point: npt.NDArray[np.floating],
+    tri: npt.NDArray[np.integer],
+    pia: npt.NDArray[np.floating],
+    wm: npt.NDArray[np.floating],
+    weights: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]:
+    """How far ``point`` is from each candidate cortical column, and where along it.
+
+    The quantity :func:`anchor_to_surfaces` selects its winner by, factored out
+    so that :mod:`cortex.electrodes._coherent` can rank *all* the candidates by
+    exactly the same measure rather than reimplementing it. Two copies of this
+    arithmetic drifting apart would be invisible: both would still return a
+    plausible anchor.
+
+    A column is the short segment from a triangle's pial point to its
+    white-matter point at the same barycentric location. Distance is measured to
+    the segment -- perpendicular within the ribbon, and to the nearer end
+    outside it -- rather than to the mid-surface, because selecting on
+    mid-surface distance biases depth toward the middle of the ribbon.
+
+    Returns ``(to_segment, t, length2, rel, column)``: the distance per
+    candidate, the normalised position along each column, each column's squared
+    length, the offset from each pial point, and the columns themselves.
+    """
+    pial_point = np.einsum("fij,fi->fj", pia[tri], weights)
+    column = np.einsum("fij,fi->fj", wm[tri], weights) - pial_point
+    length2 = np.einsum("fi,fi->f", column, column)
+    rel = point - pial_point
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t = np.einsum("fi,fi->f", rel, column) / length2
+    t = np.where(length2 > 0, t, 0.0)
+    to_segment = np.linalg.norm(
+        rel - np.clip(t, 0.0, 1.0)[:, None] * column, axis=1
+    )
+    return to_segment, t, length2, rel, column
 
 
 def _triangle_basis(
@@ -1176,16 +1218,10 @@ def regroup_anchors(
         if len(member) < 2:
             continue
         if mode == ANCHOR_AUTO:
-            kinds = {str(t).lower() for t in types[member] if str(t).strip()}
-            if kinds:
-                # An explicit label is believed, either way.
-                if not kinds & shared:
-                    continue
-            elif not is_straight(coords[member], straight_tolerance_mm):
-                # No label. Fall back to the geometry, because a montage that
-                # records no device type is common and is not a reason to give
-                # its depth electrodes the treatment meant for grids.
-                continue
+            # Nothing shares a frame under `auto` any more -- see ANCHOR_AUTO.
+            # The branch is kept rather than short-circuited so that the
+            # grouping rule stays in one place if it is ever wanted back.
+            continue
         offsets = np.where(
             np.isfinite(anchors.offset_mm[member]), anchors.offset_mm[member], np.inf
         )
