@@ -42,7 +42,7 @@ and recomputed.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Union
 
 import numpy as np
@@ -91,6 +91,102 @@ row indices still line up with a data array recorded on the same channels."""
 
 PLACEMENTS = (ON_SURFACE, PROJECTED, TOO_FAR, UNKNOWN_ANATOMY,
               NON_CORTICAL, NO_COORDINATE)
+
+#: How :meth:`ElectrodeAnchors.evaluate` treats an electrode's distance from the
+#: surface it is anchored to.
+OFFSET_NONE = "none"
+"""Land the electrode on the target surface -- the original behaviour, and still
+the default. Everything that is not on cortex is flattened onto it."""
+
+OFFSET_FRAME = "frame"
+"""Keep the electrode off the surface, at the position its residual describes.
+
+The residual is stored as three signed millimetres in the orthonormal frame of
+its anchor triangle (see :func:`frame_components`), and that frame exists on
+every surface of the subject because the triangle is named by vertex. So the
+residual can be re-expressed on the inflated or flat surface without ever
+interpolating anything across a sulcus."""
+
+OFFSETS = (OFFSET_NONE, OFFSET_FRAME)
+
+#: How the residual is scaled when the surface it rides on stretches.
+SCALE_AUTO = "auto"
+"""``similarity`` where the frame is shared by a device, ``anisotropic`` where
+each contact carries its own. The right default for a mixed montage: a depth
+electrode keeps its shape, a grid keeps its standoff in millimetres."""
+
+SCALE_SIMILARITY = "similarity"
+"""Scale all three axes by the local linear expansion. A similarity transform,
+so the device's shape and entry angle are preserved exactly and its size follows
+the cortex around it -- neighbours stay evenly spaced, and that spacing grows or
+shrinks with inflation."""
+
+SCALE_ANISOTROPIC = "anisotropic"
+"""Scale the two tangential axes and leave the normal axis in literal
+millimetres. A shear, and only sound per contact: applied to a shared device
+frame it tilts a shaft off its trajectory and makes its pitch uneven."""
+
+SCALE_RIGID = "rigid"
+"""Leave all three axes in literal millimetres. For when the offset must mean
+millimetres regardless of what the surface did."""
+
+SCALE_MODES = (SCALE_AUTO, SCALE_SIMILARITY, SCALE_ANISOTROPIC, SCALE_RIGID)
+
+#: Whether the contacts of one device share a frame.
+ANCHOR_PER_CONTACT = "per_contact"
+"""Every contact carries its own anchor. Right for a grid or strip, which drapes
+over folds and whose contacts each genuinely sit on their own column."""
+
+ANCHOR_PER_DEVICE = "per_device"
+"""One anchor for the whole device; every contact's residual is expressed in that
+frame. Right for a shaft, whose contacts do *not* each belong to the cortex
+nearest them -- a depth electrode threads folds, so per-contact anchoring makes
+consecutive contacts hop between banks."""
+
+ANCHOR_AUTO = "auto"
+""":data:`ANCHOR_PER_DEVICE` for ``seeg`` and ``depth``, :data:`ANCHOR_PER_CONTACT`
+for everything else, keyed on the group type."""
+
+ANCHOR_MODES = (ANCHOR_AUTO, ANCHOR_PER_CONTACT, ANCHOR_PER_DEVICE)
+
+#: Group types whose contacts lie along a single rigid shank, and which
+#: :data:`ANCHOR_AUTO` therefore anchors once. Matches ``_connect.LINEAR_TYPES``.
+SHARED_FRAME_TYPES = ("seeg", "depth")
+
+STRAIGHT_TOLERANCE_MM = 2.0
+"""How far a device's contacts may sit from their own best-fit line and still be
+read as a rigid shank, when the montage does not say what kind of device it is.
+
+A real montage often does not. Of the three clinical montages in this
+filestore, two carry no ``group_type`` at all -- and every one of TCH06's
+twenty-one groups is a depth electrode. Without a fallback those montages get
+per-contact anchoring, silently, which is the case
+:func:`regroup_anchors` exists to prevent.
+
+The geometry separates the two cleanly, because a depth electrode is a rigid
+needle and nothing else in the vocabulary is. Measured over those montages:
+
+===============================  ==================
+device                           max off-axis
+===============================  ==================
+27 depth shafts (TCH06, S0033)   0.00 - 0.45 mm
+3 depth shafts (S0019)           0.65 - 0.95 mm
+64-contact grid (S0019 ``LG``)   49.04 mm
+===============================  ==================
+
+Two orders of magnitude, so the threshold is not delicate. It sits above the
+0.95 mm of the least straight real shaft -- localisation from post-implant
+imaging is not exact -- and far below anything that drapes.
+
+A strip is linear but *not* straight: it follows the convexity it lies on, so
+it fails this test, correctly. Were a short strip on flat cortex to pass, the
+cost is small -- a strip hugs the surface either way -- while a shaft that
+fails to group scatters over tens of millimetres. The asymmetry is why the
+tolerance is generous rather than tight.
+
+An explicit ``group_type`` is always believed; this decides only when there is
+none.
+"""
 
 
 class SurfacePair(NamedTuple):
@@ -251,6 +347,24 @@ class ElectrodeAnchors:
     surface_hash : str
         Identifies the surfaces these anchors were computed against, so a
         cached anchor set can be recognised as stale.
+    frame : (n, 3) array of float, optional
+        The electrode's residual from its anchor point, in signed millimetres
+        along its anchor triangle's orthonormal basis -- see
+        :func:`frame_components`. This is the direction ``offset_mm`` and
+        ``depth`` throw away, and it is what lets :meth:`evaluate` put an
+        electrode *off* the surface rather than on it.
+
+        ``None`` on anchors computed before this existed, in which case
+        :meth:`evaluate` supports only :data:`OFFSET_NONE`.
+    frame_scale_mm : (n,) array of float, optional
+        Size of each electrode's own anchor triangle on the surface the frame
+        was measured against, as ``sqrt(2 * area)``. The denominator of the
+        local scale factor.
+    anchor_index : (n,) array of int, optional
+        Which electrode's triangle supplies the frame for each electrode.
+        ``arange(n)`` -- each its own -- unless :func:`regroup_anchors` has
+        given a device a shared frame. Electrodes sharing a value are one rigid
+        device, which is also how :meth:`evaluate` knows to scale them together.
     """
 
     hemi: npt.NDArray[np.str_]
@@ -264,12 +378,31 @@ class ElectrodeAnchors:
     dist_wm_mm: npt.NDArray[np.floating]
     placement: npt.NDArray[np.str_]
     surface_hash: str = ""
+    frame: Optional[npt.NDArray[np.floating]] = None
+    frame_scale_mm: Optional[npt.NDArray[np.floating]] = None
+    anchor_index: Optional[npt.NDArray[np.intp]] = None
 
     def __len__(self) -> int:
         return len(self.verts)
 
     def __getitem__(self, index: Union[int, slice, npt.NDArray]) -> "ElectrodeAnchors":
         idx = np.atleast_1d(np.asarray(index)) if isinstance(index, int) else index
+        sub = lambda a: None if a is None else a[idx]  # noqa: E731
+        # `anchor_index` names rows of the *full* set, so a subset's stored
+        # indices are meaningless unless they are renumbered -- and a device
+        # that was only partly selected has no anchor left to point at. Rebuild
+        # it where the whole device survived and fall back to self-anchoring
+        # where it did not, which is the honest answer: with the frame-defining
+        # contact gone, the remaining contacts are no longer one rigid device.
+        anchor_index = None
+        if self.anchor_index is not None:
+            keep = np.zeros(len(self), dtype=bool)
+            keep[idx] = True
+            renumber = np.full(len(self), -1, dtype=np.intp)
+            renumber[keep] = np.arange(int(keep.sum()), dtype=np.intp)
+            anchor_index = renumber[self.anchor_index[idx]]
+            orphan = anchor_index < 0
+            anchor_index[orphan] = np.nonzero(orphan)[0]
         return ElectrodeAnchors(
             hemi=self.hemi[idx],
             verts=self.verts[idx],
@@ -282,7 +415,17 @@ class ElectrodeAnchors:
             dist_wm_mm=self.dist_wm_mm[idx],
             placement=self.placement[idx],
             surface_hash=self.surface_hash,
+            frame=sub(self.frame),
+            frame_scale_mm=sub(self.frame_scale_mm),
+            anchor_index=anchor_index,
         )
+
+    @property
+    def hosts(self) -> npt.NDArray[np.intp]:
+        """:attr:`anchor_index`, defaulted to each electrode anchoring itself."""
+        if self.anchor_index is None:
+            return np.arange(len(self), dtype=np.intp)
+        return np.asarray(self.anchor_index, dtype=np.intp)
 
     @property
     def surface_distance_mm(self) -> npt.NDArray[np.floating]:
@@ -308,7 +451,11 @@ class ElectrodeAnchors:
         return np.isin(self.placement, [ON_SURFACE, PROJECTED, NON_CORTICAL])
 
     def evaluate(
-        self, surfaces: Mapping[str, npt.NDArray[np.floating]]
+        self,
+        surfaces: Mapping[str, npt.NDArray[np.floating]],
+        *,
+        offset: str = OFFSET_NONE,
+        scale_mode: str = SCALE_AUTO,
     ) -> npt.NDArray[np.floating]:
         """Positions on some other surface of the same subject.
 
@@ -321,6 +468,19 @@ class ElectrodeAnchors:
             by vertex, so the target surface's polygons are irrelevant, which
             is what lets a flat surface with a cut medial wall be evaluated at
             all.
+        offset : {"none", "frame"}
+            :data:`OFFSET_NONE` lands the electrode *on* the surface, purely
+            barycentrically. This is the original behaviour and remains the
+            default, so nothing that does not ask for the new one changes.
+
+            :data:`OFFSET_FRAME` puts it where it actually is, by re-expressing
+            the stored :attr:`frame` residual in the target triangle's own
+            basis. Evaluated against the surface the frame was measured on
+            (the pia), this reproduces the input coordinate exactly.
+        scale_mode : {"auto", "similarity", "anisotropic", "rigid"}
+            How the residual is scaled when the surface stretches. Ignored for
+            :data:`OFFSET_NONE`. See the module constants; :data:`SCALE_AUTO`
+            picks per device and is what a mixed montage wants.
 
         Returns
         -------
@@ -330,11 +490,20 @@ class ElectrodeAnchors:
 
         Notes
         -----
-        Purely barycentric: the electrode lands *on* the target surface rather
-        than at its own depth, because depth has no geometric meaning once the
-        surface is inflated or flat. Depth is what decides whether an electrode
-        is drawn at all, not where it is drawn -- see the module docstring.
+        Under :data:`OFFSET_NONE` depth is not represented: it has no geometric
+        meaning once every contact is pinned to the sheet, and it is left to
+        decide whether an electrode is drawn rather than where. Under
+        :data:`OFFSET_FRAME` it *is* represented, as real displacement off the
+        surface, and the distinction between the two is the point of the
+        argument.
         """
+        if offset not in OFFSETS:
+            raise ValueError("offset must be one of %r, got %r" % (OFFSETS, offset))
+        if scale_mode not in SCALE_MODES:
+            raise ValueError(
+                "scale_mode must be one of %r, got %r" % (SCALE_MODES, scale_mode)
+            )
+
         out = np.full((len(self), 3), np.nan)
         for hemi in HEMIS:
             if hemi not in surfaces:
@@ -344,6 +513,67 @@ class ElectrodeAnchors:
                 continue
             tri = np.asarray(surfaces[hemi])[self.verts[sel]]     # (m, 3, 3)
             out[sel] = np.einsum("mij,mi->mj", tri, self.weights[sel])
+
+        if offset == OFFSET_NONE:
+            return out
+        if self.frame is None or self.frame_scale_mm is None:
+            raise ValueError(
+                "offset=%r needs a frame, and these anchors have none. They were "
+                "computed before frames existed, or by a caller that did not pass "
+                "the coordinates. Re-run ElectrodeSet.anchor()." % (OFFSET_FRAME,)
+            )
+
+        hosts = self.hosts
+        for hemi in HEMIS:
+            if hemi not in surfaces:
+                continue
+            sel = np.nonzero(self.hemi == hemi)[0]
+            if not len(sel):
+                continue
+            pts = np.asarray(surfaces[hemi], dtype=np.float64)
+
+            # Local linear scale where each electrode itself sits, then one
+            # scale per device: the median over its contacts. The median rather
+            # than the frame-defining contact's own value, because that contact
+            # is systematically unrepresentative -- a shaft is anchored near its
+            # entry, on a gyral crown, and crowns inflate quite differently from
+            # the tissue a shaft threads. Measured on S1 over three synthetic
+            # 15-contact shafts, using the anchor's own scale rather than the
+            # device median stretched two of the three by more than 60%.
+            own_size = _triangle_basis(pts[self.verts[sel]])[3]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                own_scale = own_size / self.frame_scale_mm[sel]
+
+            scale = np.array(own_scale, dtype=np.float64)
+            shared = np.zeros(len(sel), dtype=bool)
+            for host in np.unique(hosts[sel]):
+                member = hosts[sel] == host
+                if member.sum() > 1:
+                    shared |= member
+                    with np.errstate(invalid="ignore"):
+                        scale[member] = np.nanmedian(own_scale[member])
+
+            host_tri = pts[self.verts[hosts[sel]]]
+            t1, t2, normal, _ = _triangle_basis(host_tri)
+            origin = np.einsum("mij,mi->mj", host_tri, self.weights[hosts[sel]])
+
+            if scale_mode == SCALE_RIGID:
+                tangential, perpendicular = np.ones_like(scale), np.ones_like(scale)
+            elif scale_mode == SCALE_SIMILARITY:
+                tangential, perpendicular = scale, scale
+            elif scale_mode == SCALE_ANISOTROPIC:
+                tangential, perpendicular = scale, np.ones_like(scale)
+            else:  # SCALE_AUTO
+                tangential = scale
+                perpendicular = np.where(shared, scale, 1.0)
+
+            f = self.frame[sel]
+            out[sel] = (
+                origin
+                + (tangential * f[:, 0])[:, None] * t1
+                + (tangential * f[:, 1])[:, None] * t2
+                + (perpendicular * f[:, 2])[:, None] * normal
+            )
         return out
 
     def summary(self) -> str:
@@ -563,6 +793,156 @@ def _anchor_one_hemisphere(
     )
 
 
+def _triangle_basis(
+    tri: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]:
+    """An orthonormal frame per triangle, plus the edge it was built from.
+
+    Parameters
+    ----------
+    tri : (m, 3, 3) array
+        ``m`` triangles, each three points.
+
+    Returns
+    -------
+    t1, t2, normal : (m, 3) arrays
+        A right-handed orthonormal basis. ``t1`` runs along the ``v0 -> v1``
+        edge and ``normal`` is the triangle's own normal.
+    scale_mm : (m,) array
+        ``sqrt(2 * area)``, a length-like measure of the triangle's size. Kept
+        because it is the only thing that makes the frame comparable between two
+        surfaces: the *ratio* of this quantity on the target to its value on the
+        source is the local linear scale factor the residual rides on.
+
+        From the area rather than from the ``v0 -> v1`` edge, even though that
+        edge is what fixes ``t1``. A single edge's length is a noisy estimate of
+        an isotropic quantity, and *which* edge is ``v0 -> v1`` is an artifact of
+        how the triangle happened to be written down.
+
+    Notes
+    -----
+    Built from the triangle's own edge rather than from an arbitrary reference
+    direction, because that is what makes the basis *portable*. The same three
+    vertex indices name a triangle on every surface of the subject, so a frame
+    defined this way rotates and stretches with the surface, and re-expressing a
+    residual in it never interpolates between two points that are near in space
+    but far through the tissue.
+
+    A degenerate triangle -- zero area, or a zero-length first edge -- yields a
+    NaN frame rather than a fabricated one. The flat surface has genuinely
+    degenerate triangles, since ``freesurfer._move_disconnect_points_to_zero``
+    collapses unreferenced vertices to the origin.
+    """
+    tri = np.asarray(tri, dtype=np.float64)
+    e1 = tri[:, 1] - tri[:, 0]
+    e2 = tri[:, 2] - tri[:, 0]
+
+    normal = np.cross(e1, e2)
+    nlen = np.linalg.norm(normal, axis=1)
+    e1len = np.linalg.norm(e1, axis=1)
+    ok = (nlen > 0) & (e1len > 0)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        normal = normal / np.where(ok, nlen, 1.0)[:, None]
+        t1 = e1 / np.where(ok, e1len, 1.0)[:, None]
+        # e1 lies in the triangle's plane, so it is already perpendicular to the
+        # normal and this subtraction is a no-op to floating point. Done anyway
+        # so a nearly-degenerate triangle degrades smoothly rather than tilting
+        # the frame out of the surface.
+        t1 = t1 - np.einsum("mi,mi->m", t1, normal)[:, None] * normal
+        t1len = np.linalg.norm(t1, axis=1)
+        ok = ok & (t1len > 0)
+        t1 = t1 / np.where(ok, t1len, 1.0)[:, None]
+
+    t2 = np.cross(normal, t1)
+
+    bad = ~ok
+    t1[bad] = np.nan
+    t2[bad] = np.nan
+    normal[bad] = np.nan
+    return t1, t2, normal, np.where(ok, np.sqrt(nlen), np.nan)
+
+
+def frame_components(
+    coords: npt.NDArray[np.floating],
+    anchors: "ElectrodeAnchors",
+    surfaces: Mapping[str, npt.NDArray[np.floating]],
+    anchor_index: Optional[npt.NDArray[np.integer]] = None,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Each electrode's residual, in the orthonormal frame of its anchor triangle.
+
+    This is the whole of what :data:`OFFSET_FRAME` needs to store, and it is
+    three numbers: how far the electrode is from its anchor point along each
+    axis of a basis the anchor triangle defines. Together with the barycentric
+    anchor it is a *complete* description of the electrode's position -- unlike
+    ``depth`` and ``offset_mm``, which record magnitudes and throw the direction
+    away.
+
+    Parameters
+    ----------
+    coords : (n, 3) array
+        The electrode coordinates, in the same frame as ``surfaces``. For a
+        subject whose surfaces were converted by ``mris_convert --to-scanner``
+        this means TkRegRAS *plus* ``surface_space_offset`` -- the same shifted
+        copy the anchoring itself was done against, never the raw column.
+    anchors : ElectrodeAnchors
+        Supplies ``verts``, ``weights`` and ``hemi``.
+    surfaces : mapping
+        ``{"lh": pts, "rh": pts}`` for the surface the residual is measured
+        against. Anchoring measures depth from the pia, so this should be the
+        pial surface if the two are to agree.
+    anchor_index : (n,) array of int, optional
+        Which electrode's triangle defines the frame for each electrode.
+        Defaults to each its own. Anything else means a shared frame -- see
+        :func:`regroup_anchors`.
+
+    Returns
+    -------
+    frame : (n, 3) array
+        Signed millimetres along ``(t1, t2, normal)`` of the anchor triangle.
+    scale_mm : (n,) array
+        Size of each electrode's *own* triangle on this surface, as
+        ``sqrt(2 * area)``. Its own, not its anchor's, because this is what the
+        local scale factor is measured from at evaluation time, and a device's
+        scale is the median over its contacts' own neighbourhoods.
+    """
+    coords = np.atleast_2d(np.asarray(coords, dtype=np.float64))
+    n = len(anchors)
+    if len(coords) != n:
+        raise ValueError(
+            "coords has %d rows but there are %d anchors" % (len(coords), n)
+        )
+    if anchor_index is None:
+        anchor_index = np.arange(n, dtype=np.intp)
+    anchor_index = np.asarray(anchor_index, dtype=np.intp)
+
+    frame = np.full((n, 3), np.nan)
+    scale_mm = np.full(n, np.nan)
+
+    for hemi in HEMIS:
+        if hemi not in surfaces:
+            continue
+        sel = np.nonzero(anchors.hemi == hemi)[0]
+        if not len(sel):
+            continue
+        pts = np.asarray(surfaces[hemi], dtype=np.float64)
+
+        # The scale factor is a property of where the electrode itself sits, so
+        # it comes from its own triangle even when the frame comes from another.
+        scale_mm[sel] = _triangle_basis(pts[anchors.verts[sel]])[3]
+
+        host = anchor_index[sel]
+        tri = pts[anchors.verts[host]]
+        t1, t2, normal, _ = _triangle_basis(tri)
+        origin = np.einsum("mij,mi->mj", tri, anchors.weights[host])
+        rel = coords[sel] - origin
+        frame[sel, 0] = np.einsum("mi,mi->m", rel, t1)
+        frame[sel, 1] = np.einsum("mi,mi->m", rel, t2)
+        frame[sel, 2] = np.einsum("mi,mi->m", rel, normal)
+
+    return frame, scale_mm
+
+
 def surface_hash(hemis: Mapping[str, SurfacePair]) -> str:
     """A short digest of the surfaces an anchor set was computed against."""
     digest = hashlib.sha1()
@@ -659,7 +1039,160 @@ def anchor_to_surfaces(
     )
     anchors.placement = classify_placement(anchors, policy, anatomy)
     anchors.placement[~finite] = NO_COORDINATE
+
+    # The residual, measured against the pia so it agrees with `depth`, whose
+    # zero is the pial surface. Cheap -- one triangle basis per electrode, no
+    # search -- and it is what makes `evaluate(offset="frame")` possible at all.
+    anchors.frame, anchors.frame_scale_mm = frame_components(
+        coords, anchors, {h: hemis[h].pia for h in hemis}
+    )
     return anchors
+
+
+def is_straight(
+    points: npt.NDArray[np.floating], tolerance_mm: float = STRAIGHT_TOLERANCE_MM
+) -> bool:
+    """Whether these contacts lie along one straight line, within a tolerance.
+
+    How a device with no recorded ``group_type`` is recognised as a rigid shank.
+    See :data:`STRAIGHT_TOLERANCE_MM` for the measurement the threshold comes
+    from.
+
+    Fewer than three finite points is not evidence of anything -- two points are
+    always collinear -- so it answers False rather than letting a pair of
+    contacts claim to be a device.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < 3:
+        return False
+    centred = points - points.mean(0)
+    axis = np.linalg.svd(centred, full_matrices=False)[2][0]
+    residual = centred - np.outer(centred @ axis, axis)
+    return bool(np.linalg.norm(residual, axis=1).max() <= tolerance_mm)
+
+
+def regroup_anchors(
+    anchors: ElectrodeAnchors,
+    coords: npt.NDArray[np.floating],
+    surfaces: Mapping[str, npt.NDArray[np.floating]],
+    groups: Optional[Sequence[str]] = None,
+    group_types: Optional[Sequence[str]] = None,
+    mode: str = ANCHOR_AUTO,
+    shared_frame_types: Sequence[str] = SHARED_FRAME_TYPES,
+    straight_tolerance_mm: float = STRAIGHT_TOLERANCE_MM,
+) -> ElectrodeAnchors:
+    """Give each device's contacts one shared frame, where that is the right model.
+
+    Per-contact anchoring assumes every contact belongs to the cortex nearest
+    it. For a grid that is true. For a depth electrode it is false in a way that
+    destroys the montage: a shaft threads folds, so consecutive contacts anchor
+    to different sulcal banks and the device arrives as a cloud rather than a
+    track. Measured on S1, a 15-contact shaft at a uniform 4 mm pitch evaluates
+    on the inflated surface with consecutive spacings from 0.0 to 29.4 mm -- two
+    contacts on the identical vertex, and one 4 mm step becoming 29.4 mm.
+
+    Anchoring the device once and expressing every contact's residual in that
+    one frame makes it a rigid body again: spacing is uniform by construction
+    and the entry angle is exact.
+
+    Separate from :func:`anchor_to_surfaces` for the same reason
+    :func:`classify_placement` is -- so changing the grouping does not re-run
+    the geometry.
+
+    Parameters
+    ----------
+    anchors : ElectrodeAnchors
+        Anchors that already carry a frame.
+    coords : (n, 3) array
+        The same coordinates the anchors were computed from, in the same frame
+        -- shifted by ``surface_space_offset`` if the anchoring was.
+    surfaces : mapping
+        The surface the frames are measured against, i.e. the pia.
+    groups : (n,) sequence of str, optional
+        Device name per electrode. Without it nothing is shared and the anchors
+        come back unchanged.
+    group_types : (n,) sequence of str, optional
+        ``grid`` / ``strip`` / ``seeg`` / ``depth``, consulted by
+        :data:`ANCHOR_AUTO`. Where a group records none, :data:`ANCHOR_AUTO`
+        falls back to :func:`is_straight` -- real montages routinely omit this
+        column, and two of the three in this filestore do.
+    mode : {"auto", "per_contact", "per_device"}
+    shared_frame_types : sequence of str
+        Which ``group_types`` :data:`ANCHOR_AUTO` treats as one rigid device.
+    straight_tolerance_mm : float
+        Passed to :func:`is_straight` for the unlabelled case.
+
+    Returns
+    -------
+    ElectrodeAnchors
+        A new set; the input is not modified.
+
+    Notes
+    -----
+    Which contact of a device supplies the frame is decided by the smallest
+    :attr:`offset_mm` -- the contact best explained by the column it sits over,
+    and so the one whose triangle is least likely to be a bank it merely passed
+    near. Deliberately not the shallowest contact: ``depth`` is not trustworthy
+    for exactly the contacts this function exists to fix, since a deep contact
+    anchored to a distant bank reports a depth relative to *that* bank. On the
+    S1 shaft above, ``depth`` runs to -6.1 -- nominally outside the pia -- for
+    contacts several centimetres inside the brain.
+
+    A device is never allowed to span hemispheres: contacts are grouped by
+    ``(group, hemi)``, so a mislabelled or genuinely bilateral group splits
+    rather than anchoring one side to the other.
+    """
+    if mode not in ANCHOR_MODES:
+        raise ValueError("mode must be one of %r, got %r" % (ANCHOR_MODES, mode))
+    if mode == ANCHOR_PER_CONTACT or groups is None:
+        return anchors
+
+    n = len(anchors)
+    groups = np.asarray(groups, dtype=object)
+    if len(groups) != n:
+        raise ValueError("groups has %d entries but there are %d anchors" % (len(groups), n))
+    if group_types is None:
+        types = np.array([""] * n, dtype=object)
+    else:
+        types = np.asarray(group_types, dtype=object)
+        if len(types) != n:
+            raise ValueError(
+                "group_types has %d entries but there are %d anchors" % (len(types), n)
+            )
+
+    shared = {str(t).lower() for t in shared_frame_types}
+    hosts = np.arange(n, dtype=np.intp)
+
+    # A contact with no coordinate has no anchor worth sharing and no residual
+    # to express; leave it self-anchored so it stays NaN rather than being
+    # placed by its neighbours' frame.
+    usable = anchors.placement != NO_COORDINATE
+
+    for key in {(g, h) for g, h in zip(groups, anchors.hemi)}:
+        member = np.nonzero(
+            (groups == key[0]) & (anchors.hemi == key[1]) & usable
+        )[0]
+        if len(member) < 2:
+            continue
+        if mode == ANCHOR_AUTO:
+            kinds = {str(t).lower() for t in types[member] if str(t).strip()}
+            if kinds:
+                # An explicit label is believed, either way.
+                if not kinds & shared:
+                    continue
+            elif not is_straight(coords[member], straight_tolerance_mm):
+                # No label. Fall back to the geometry, because a montage that
+                # records no device type is common and is not a reason to give
+                # its depth electrodes the treatment meant for grids.
+                continue
+        offsets = np.where(
+            np.isfinite(anchors.offset_mm[member]), anchors.offset_mm[member], np.inf
+        )
+        hosts[member] = member[int(np.argmin(offsets))]
+
+    frame, scale = frame_components(coords, anchors, surfaces, anchor_index=hosts)
+    return replace(anchors, frame=frame, frame_scale_mm=scale, anchor_index=hosts)
 
 
 def classify_placement(

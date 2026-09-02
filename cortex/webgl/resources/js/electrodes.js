@@ -75,6 +75,14 @@ var electrodes = (function(module) {
         // implanted, and `depth_follows_slider` gets the old behaviour for
         // anyone reading depth off the slider deliberately.
         this.depthFollowsSlider = json.depth_follows_slider === true;
+        // Draw each contact at its real distance off the surface rather than on
+        // it. On by default: it is the honest picture of where the electrodes
+        // are, and for a depth electrode it is the difference between a track
+        // through the brain and a cloud of dots -- measured on S1, a shaft at a
+        // uniform 4 mm pitch projects onto the inflated surface with steps
+        // ranging from 1.7 to 40.5 mm. A montage with no frames in its payload
+        // falls back to the projected positions on its own.
+        this.offsets = json.offsets === undefined ? true : !!json.offsets;
         this._visible = true;
 
         this.markers = {left:new THREE.Group(), right:new THREE.Group()};
@@ -109,6 +117,14 @@ var electrodes = (function(module) {
             var verts = [
                 map[contact.verts[0]], map[contact.verts[1]], map[contact.verts[2]],
             ];
+            // The frame's host triangle makes the same two trips. It is usually
+            // this contact's own triangle and is a different one for a depth
+            // electrode, whose contacts share a single frame.
+            var frameVerts = contact.frame_verts === undefined ? verts : [
+                map[contact.frame_verts[0]],
+                map[contact.frame_verts[1]],
+                map[contact.frame_verts[2]],
+            ];
             // What the montage says, kept so it can be restored when a view
             // that overrode it is unbound.
             var shape = module.SHAPES[contact.group_type] || module.DEFAULT_SHAPE;
@@ -133,6 +149,19 @@ var electrodes = (function(module) {
                 verts:      verts,
                 rawVerts:   [contact.verts[0], contact.verts[1], contact.verts[2]],
                 weights:    contact.weights,
+                // How far this contact is from its anchor point, in signed
+                // millimetres along the host triangle's frame. Null where the
+                // anchor triangle was degenerate or the payload predates
+                // frames, in which case the contact falls back to being drawn
+                // on the surface.
+                frame:       contact.frame === undefined ? null : contact.frame,
+                frameVerts:  frameVerts,
+                frameWeights: contact.frame_weights === undefined
+                                ? contact.weights : contact.frame_weights,
+                frameScale:  contact.frame_scale_mm === undefined
+                                ? null : contact.frame_scale_mm,
+                // Contacts sharing this move as one rigid device.
+                device:      contact.device === undefined ? i : contact.device,
                 shape:      shape,
                 radius:     radius,
                 baseShape:  shape,
@@ -166,6 +195,7 @@ var electrodes = (function(module) {
             visible: {action:[this, "setVisible"]},
             labels:  {action:[this, "setLabels"]},
             connections: {action:[this, "setConnections"]},
+            offsets: {action:[this, "setOffsets"]},
             depth_window: {action:[this, "setDepthWindow", 0.0, 20.0]},
             depth_follows_slider: {action:[this, "setDepthFollowsSlider"]},
             shape: {action:[this, "setShape", ["auto", "sphere", "cube", "diamond"]]},
@@ -174,23 +204,92 @@ var electrodes = (function(module) {
             this.ui.addFolder("filter", true, this.filterUI);
     }
 
-    // Re-place every marker for the current inflation and depth. Called on each
-    // "mix" event, which the surface dispatches whenever either changes.
+    // The local linear scale factor for every contact, for the current mix.
     //
-    // Two regimes, because an electrode has two positions and only one of them
-    // is true at a time. On the anatomical surface the contact's measured
-    // TkRegRAS coordinate is exactly right, and it should be drawn there
-    // whether or not that puts it on the cortex -- a depth contact belongs
-    // inside the brain, and snapping it to a gyrus would be a lie. Once the
-    // surface starts to deform, that coordinate means nothing, and the anchor
-    // is all that is left. So: true coordinate at surfmix 0, anchored position
-    // by the time the first morph target is reached, linear in between.
-    module.Electrodes.prototype.setMix = function(evt) {
-        var morphs = this.surf.names.length - 1;
-        var t = Math.max(0, Math.min(1, evt.mix * morphs));
+    // Recomputed per mix event rather than sent from python, because the
+    // surface being scaled against is a morph target that changes as the slider
+    // moves -- there is no single "target surface" to precompute against.
+    //
+    // One scale per *device*, taken as the median over its contacts' own
+    // triangles rather than from the one contact whose triangle defines the
+    // frame. A shaft is anchored near its entry, and an entry point sits on a
+    // gyral crown, which inflates quite differently from the tissue the shaft
+    // threads: measured on S1 over three synthetic shafts, using the anchor's
+    // own scale stretched two of the three by more than 60%. Individual anchors
+    // hop between banks, but a median over them is an aggregate rather than a
+    // position, and is steady.
+    module.Electrodes.prototype._scaleFactors = function(evt) {
+        var own = new Array(this.contacts.length);
+        var frames = new Array(this.contacts.length);
+        var byDevice = {};
 
         for (var i = 0; i < this.contacts.length; i++) {
             var contact = this.contacts[i];
+            own[i] = null;
+            // Kept so setMix can reuse it. Every contact that anchors itself --
+            // which is every grid and strip contact, and so most of a montage --
+            // needs exactly this frame again a moment later, and get_position is
+            // three Vector3 allocations deep per corner. Recomputing it would
+            // double the per-frame cost of a large grid while the user is
+            // dragging a slider.
+            frames[i] = null;
+            if (contact.frame === null || !contact.frameScale)
+                continue;
+            var here = mriview.get_position_frame(
+                this.posdata[contact.hemi], evt.mix, evt.thickmix,
+                contact.verts, contact.weights
+            );
+            if (here === null)
+                continue;
+            frames[i] = here;
+            own[i] = here.scale / contact.frameScale;
+            if (byDevice[contact.device] === undefined)
+                byDevice[contact.device] = [];
+            byDevice[contact.device].push(own[i]);
+        }
+
+        var median = {};
+        for (var key in byDevice) {
+            var values = byDevice[key].slice().sort(function(a, b) { return a - b; });
+            var mid = Math.floor(values.length / 2);
+            median[key] = values.length % 2
+                ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+        }
+
+        var out = new Array(this.contacts.length);
+        for (var i = 0; i < this.contacts.length; i++) {
+            var device = this.contacts[i].device;
+            out[i] = median[device] === undefined ? own[i] : median[device];
+        }
+        return {scale:out, shared:byDevice, frames:frames};
+    }
+
+    // Re-place every marker for the current inflation and depth. Called on each
+    // "mix" event, which the surface dispatches whenever either changes.
+    //
+    // With `offsets` on, a contact is drawn at its real distance off the sheet:
+    // the barycentric anchor says where in the surface it belongs and the stored
+    // frame residual says how far off it, re-expressed in the anchor triangle's
+    // basis under the current morph. At surfmix 0 that basis is the pial one, so
+    // the reconstruction *is* the measured coordinate -- exactly, with no
+    // special case and no lerp. That is why the two regimes the old code
+    // interpolated between collapse into one here.
+    //
+    // With `offsets` off it is the original behaviour: the measured coordinate
+    // on the anatomical surface, crossing over to the projected anchor as soon
+    // as the surface deforms, linear in between. Kept because pinning contacts
+    // to the sheet is the right picture for a subdural grid, where the standoff
+    // is a millimetre of dura and drawing it only lifts the markers off the
+    // surface they are meant to be read against.
+    module.Electrodes.prototype.setMix = function(evt) {
+        var morphs = this.surf.names.length - 1;
+        var t = Math.max(0, Math.min(1, evt.mix * morphs));
+        var factors = this.offsets ? this._scaleFactors(evt) : null;
+
+        for (var i = 0; i < this.contacts.length; i++) {
+            var contact = this.contacts[i];
+            var usable = this.offsets && contact.frame !== null
+                         && factors.scale[i] !== null;
 
             if (t < 1) {
                 // The browser's base surface is the pia in its original
@@ -202,7 +301,6 @@ var electrodes = (function(module) {
                 // Anatomical surface: every contact is at its measured position,
                 // so there is no "sampled depth" to be near or far from.
                 contact.mesh.visible = this._visible && this._passesFilters(contact);
-
                 contact.mesh.position.copy(this._raw);
                 continue;
             }
@@ -213,9 +311,46 @@ var electrodes = (function(module) {
             // drawn. Hide it rather than project it onto a surface it is not
             // near, which is the same reasoning as the placement policy: draw
             // what is there, not what would look tidy.
-            contact.mesh.visible = this._visible && this._passesFilters(contact) && this._nearSampledDepth(contact, evt.thickmix);
+            //
+            // Applied whether or not the contact is drawn at its own depth.
+            // There is an argument that a contact drawn off the sheet is no
+            // longer claiming to be on it and so needs no such filter, and it
+            // is wrong: the depth window is off by default and exists only
+            // because somebody asked for it, so skipping it here would take
+            // away a control the caller deliberately turned on, silently, and
+            // only for montages that happen to carry frames.
+            contact.mesh.visible = this._visible && this._passesFilters(contact)
+                && this._nearSampledDepth(contact, evt.thickmix);
             if (!contact.mesh.visible)
                 continue;
+
+            if (usable) {
+                // A contact that anchors itself already had its frame built in
+                // _scaleFactors; only a shared device needs another one.
+                var frame = contact.device === contact.index
+                    ? factors.frames[i]
+                    : mriview.get_position_frame(
+                        this.posdata[contact.hemi], evt.mix, evt.thickmix,
+                        contact.frameVerts, contact.frameWeights
+                    );
+                if (frame !== null) {
+                    // Uniform scale where a device shares a frame, so its shape
+                    // and entry angle are preserved exactly and only its size
+                    // follows the cortex. Where each contact carries its own,
+                    // the normal component stays in literal millimetres: that is
+                    // a subdural standoff, and it should read as the millimetre
+                    // it is rather than shrinking with the sheet.
+                    var s = factors.scale[i];
+                    var shared = factors.shared[contact.device] !== undefined
+                                 && factors.shared[contact.device].length > 1;
+                    var perp = shared ? s : 1.0;
+                    contact.mesh.position.copy(frame.origin)
+                        .add(frame.t1.multiplyScalar(s * contact.frame[0]))
+                        .add(frame.t2.multiplyScalar(s * contact.frame[1]))
+                        .add(frame.normal.multiplyScalar(perp * contact.frame[2]));
+                    continue;
+                }
+            }
 
             var vert = mriview.get_position_bary(
                 this.posdata[contact.hemi], evt.mix, evt.thickmix,
@@ -228,6 +363,15 @@ var electrodes = (function(module) {
         this._placeConnections();
         this._placeLabels();
     }
+
+    // Whether contacts are drawn at their real distance off the surface, or
+    // pinned to it. See setMix for what each picture is good for.
+    module.Electrodes.prototype.setOffsets = function(val) {
+        if (val === undefined)
+            return this.offsets;
+        this.offsets = !!val;
+        this._refresh();
+    };
 
     // Draw markers whatever is in front of them. Needed the moment the surface
     // goes translucent: blending does not remove it from the depth buffer, so a

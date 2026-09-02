@@ -60,6 +60,33 @@ def build_grid(subject=SUBJECT, n=8, pitch=PITCH):
     return eset
 
 
+def build_shaft(subject=SUBJECT, n=15, pitch=4.0):
+    """A depth electrode: contacts at a uniform pitch along one straight track.
+
+    The seed enters laterally so the shaft stays inside its own hemisphere -- a
+    trajectory driven inward from a medially-facing vertex crosses the midline,
+    which no real one does and which splits the device in two.
+    """
+    from cortex import polyutils
+
+    pair = load_surface_pairs(subject)["lh"]
+    normals = np.asarray(
+        polyutils.Surface(pair.pia.astype(np.float64), pair.polys).vertex_normals
+    )
+    seed = 84217
+    coords = pair.pia[seed] - np.outer(np.arange(n) * pitch, normals[seed])
+
+    eset = ElectrodeSet(
+        names=["LTD%d" % (i + 1) for i in range(n)],
+        coords=coords,
+        subject=subject,
+        group=["LTD"] * n,
+        group_type=["seeg"] * n,
+    )
+    eset.anchor()
+    return eset
+
+
 def _unwrap_list(value):
     """Peel the python bridge's wrapping off a list it returned.
 
@@ -473,6 +500,136 @@ class TestMarkersInTheViewer:
                 break
             time.sleep(0.1)
         assert os.path.getsize(out) > 0
+
+
+# -- a depth electrode drawn off the surface -------------------------------
+
+@pytest.mark.skipif(not has_playwright, reason="playwright and chromium are required")
+class TestAShaftKeepsItsShapeInTheViewer:
+    """The end-to-end version of the frame machinery, in a real browser.
+
+    The python tests assert that a shared frame keeps a shaft rigid. This one
+    asserts the browser agrees, which is a separate claim: the frame is rebuilt
+    there from three ``get_position`` calls against a morphing surface, through
+    two vertex permutations, with the scale recomputed per mix event. Any of
+    those going wrong still draws markers on a brain.
+
+    Asserted as a *pitch*, not a picture. A shaft drawn with the wrong indices
+    or the wrong basis still photographs like a depth electrode -- that is the
+    lesson the grid tests in this file were written from, and it applies harder
+    here because a scatter of dots inside a translucent brain looks much like a
+    track.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _viewer(self, request):
+        eset = build_shaft()
+        cls = request.cls
+        cls.eset = eset
+        with cortex.export.headless_viewer(
+            cortex.Vertex.random(SUBJECT), viewer_params=dict(electrodes=eset)
+        ) as handle:
+            time.sleep(3)
+            cls.handle = handle
+            yield
+
+    def _positions(self):
+        reported = type(self).handle.surfs[0].surf.electrodes.describe()
+        while (isinstance(reported, list) and len(reported) == 1
+               and isinstance(reported[0], list)):
+            reported = reported[0]
+        order = {name: i for i, name in enumerate(type(self).eset.names)}
+        reported = sorted(reported, key=lambda c: order[c["name"]])
+        return np.array([c["position"] for c in reported])
+
+    def _unfold(self, value):
+        type(self).handle.ui.set("surface.S1.unfold", value)
+        time.sleep(2)
+        return self._positions()
+
+    def test_the_payload_carries_one_frame_for_the_whole_device(self):
+        payload = to_viewer_json(type(self).eset)
+        devices = {c["device"] for c in payload["electrodes"]}
+        assert len(devices) == 1
+        assert all(c["frame"] is not None for c in payload["electrodes"])
+        assert all(c["frame_scale_mm"] for c in payload["electrodes"])
+
+    def test_the_frame_triangle_is_converted_like_any_other_vertex(self, ctmfile):
+        """``frame_verts`` makes the same CTM trip ``verts`` does.
+
+        Sending it unconverted is the exact failure mode section 5 of the design
+        document describes: the markers still land on the surface and still
+        track the morph, and are simply anchored to the wrong triangle. Nothing
+        about the picture says so, which is why this is asserted on the payload.
+        """
+        eset = type(self).eset
+        payload = to_viewer_json(eset, ctm_index=ctm_vertex_index(ctmfile))
+        sent = [c["frame_verts"] for c in payload["electrodes"]]
+
+        # Every contact of this shaft shares one frame, so every payload row
+        # names the same triangle.
+        assert all(row == sent[0] for row in sent)
+
+        # And it is the converted form of the host's triangle, not the raw one.
+        host = int(eset.anchors.hosts[0])
+        assert sent[0] != [int(v) for v in eset.anchors.verts[host]]
+        expected = payload["electrodes"][
+            [c["index"] for c in payload["electrodes"]].index(host)
+        ]["verts"]
+        assert sent[0] == expected
+
+    def test_on_the_anatomical_surface_the_contacts_are_where_they_were_measured(self):
+        """Reconstruction, not a special case.
+
+        At unfold 0 the frame is rebuilt against the pial triangle, so the
+        residual reproduces the measured coordinate exactly -- the same identity
+        the python tests assert, arrived at through the browser's own arithmetic.
+        """
+        assert np.allclose(self._unfold(0.0), type(self).eset.coords, atol=1e-2)
+
+    def test_inflating_keeps_the_pitch_uniform(self):
+        """What the whole mechanism is for.
+
+        Projected, this shaft's consecutive spacings on the inflated surface run
+        from 1.7 to 40.5 mm. Carried through one frame they are all equal, and
+        the tolerance here is loose only because the value comes back through a
+        JSON bridge -- the arithmetic itself is exact.
+        """
+        positions = self._unfold(1.0)
+        steps = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+        assert steps.min() > 0.5
+        assert (steps.max() - steps.min()) < 0.05 * steps.mean()
+
+        centred = positions - positions.mean(0)
+        axis = np.linalg.svd(centred, full_matrices=False)[2][0]
+        off_line = np.linalg.norm(centred - np.outer(centred @ axis, axis), axis=1)
+        assert off_line.max() < 0.05 * steps.mean()
+
+    def test_turning_offsets_off_gives_the_projected_positions_back(self):
+        """The control, and the proof the two paths genuinely differ.
+
+        Without it a bug that quietly ignored the frame would pass every
+        assertion above that does not measure the pitch.
+        """
+        self._unfold(1.0)
+        electrodes = type(self).handle.surfs[0].surf.electrodes
+        electrodes.setOffsets(False)
+        time.sleep(1.5)
+        projected = self._positions()
+        electrodes.setOffsets(True)
+        time.sleep(1.5)
+        carried = self._positions()
+
+        spread = lambda p: np.ptp(  # noqa: E731
+            np.linalg.norm(np.diff(p, axis=0), axis=1)
+        )
+        assert spread(projected) > 10.0
+        assert spread(carried) < 0.5
+
+    def test_the_page_raises_no_errors(self):
+        errors = [e for e in type(self).handle._pw_thread.browser_errors
+                  if "[pageerror]" in e]
+        assert errors == [], "JS errors: %s" % errors
 
 
 # -- markers coloured from data --------------------------------------------

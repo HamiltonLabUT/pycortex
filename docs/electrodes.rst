@@ -92,10 +92,22 @@ set requires unique names.
 Are the coordinates in the right space?
 ---------------------------------------
 
-Electrode coordinates are **TkRegRAS**, the space FreeSurfer's surfaces are
-already in, and therefore the space pycortex holds them in. A montage from
-another pipeline may not be, and nothing about a wrong frame is visible on a
-flatmap -- a grid shifted 15 mm still looks like a grid.
+Electrode coordinates are **TkRegRAS**, the space FreeSurfer writes its surfaces
+in. Pycortex's stored surfaces are usually *not* in that space: ``import_subj``
+converts them with ``mris_convert --to-scanner``, which adds ``c_ras``, so they
+are in scanner RAS. The difference is a few millimetres -- 4.70 mm on one
+subject in this filestore, 3.35 on another -- which is enough to move every
+contact to the neighbouring gyrus.
+
+:func:`~cortex.electrodes.ElectrodeSet.anchor` handles this for you, reading the
+GIFTI's own record of which space it is in and shifting a *copy* of the
+coordinates; :attr:`~cortex.electrodes.ElectrodeSet.coords` is never modified.
+You only need to think about it if you pass ``surfaces=`` explicitly, which
+means taking responsibility for the frame they are in.
+
+A montage from another pipeline may be in neither space, and nothing about a
+wrong frame is visible on a flatmap -- a grid shifted 15 mm still looks like a
+grid.
 
 :func:`~cortex.electrodes.check_alignment` asks the question directly::
 
@@ -169,6 +181,65 @@ surface pycortex holds::
 ``nudge`` is on by default, matching :meth:`cortex.database.Database.get_surf`,
 which shifts the hemispheres apart for every surface but the fiducial. Anchoring
 itself always happens un-nudged.
+
+
+On the surface, or off it
+-------------------------
+
+By default ``positions`` puts every contact *on* the surface. That is right for
+a subdural grid, whose contacts sit a fraction of a millimetre from the column
+they anchor to, and wrong for a depth electrode, which is not on the surface at
+all::
+
+    xyz = eset.positions("inflated", offset="frame")
+
+``offset="frame"`` draws each contact at its real distance off the surface,
+by storing the displacement from its anchor point in an orthonormal frame the
+anchor triangle defines. Because the same three vertex indices name a triangle
+on every surface of the subject, that frame can be rebuilt on the inflated or
+flat surface and the displacement re-expressed there.
+
+Why it matters, measured on ``S1``: a 15-contact shaft at a uniform 4 mm pitch
+driven 56 mm inward projects onto the inflated surface with consecutive spacings
+running from 1.7 to **40.5 mm**, because each contact anchors to whichever sulcal
+bank it happens to pass. Carried through one frame, they are all equal.
+
+No individual contact looks wrong -- projection moves none of them more than
+5.7 mm, even one 56 mm deep, because cortex folds densely enough that nothing is
+ever far from *some* bank. The damage is entirely in the relative geometry, so
+per-contact checks cannot see it.
+
+Devices are grouped automatically by ``group_type``: ``seeg`` and ``depth``
+groups share one frame and stay rigid, everything else keeps a frame per contact
+and drapes over the folds.
+
+Many montages record no ``group_type`` at all, so where it is missing the
+grouping falls back to the geometry -- a depth electrode is a rigid needle and
+nothing else in the vocabulary is. Measured across real montages, shafts sit
+within 0.95 mm of their own best-fit line and a 64-contact grid sits 49 mm off
+it, so the two do not overlap. A strip is linear but follows the convexity it
+lies on, and is correctly not treated as rigid. An explicit ``group_type`` is
+always believed; this only decides the unlabelled case.
+
+:func:`~cortex.electrodes.regroup_anchors` and ``anchor(anchor_mode=...)``
+override all of it.
+
+What survives the trip:
+
+============================  =========================  ======================
+quantity                      seeg / depth               grid / strip
+============================  =========================  ======================
+within-group spacing          **uniform**, scaled        follows local stretch
+straightness, entry angle     **exact**                  n/a
+distance off the sheet        scaled                     exact, in mm
+============================  =========================  ======================
+
+A grid deliberately keeps none of that rigidity: inflation stretches the sheet
+unevenly, and that unevenness is the signal -- it is what says which contacts
+were buried in a sulcus.
+
+Asking for the ``pia`` this way returns the input coordinates exactly, which is
+a useful check that a montage is in the space you think it is.
 
 
 Placement: what the policy did, and to what
@@ -289,13 +360,18 @@ What is sent to the browser is not a position but the anchor, and the marker is
 re-placed on every ``mix`` event, so contacts travel with the cortex as you drag
 the ``unfold`` slider.
 
-Two regimes, because a contact has two positions and only one of them is true at
-a time. On the anatomical surface the measured TkRegRAS coordinate is exactly
-right and the marker is drawn there, whether or not that puts it on the cortex
--- a depth contact belongs inside the brain, and snapping it to a gyrus would be
-a lie. Once the surface starts to deform that coordinate means nothing and the
-anchor is all there is, so the marker moves to the anchored position, linearly
-across the start of the morph.
+With ``offsets`` on -- the default -- the marker is drawn at its real distance
+off the surface, by rebuilding its stored frame against whatever the inflation
+slider is showing. On the anatomical surface that reconstruction *is* the
+measured TkRegRAS coordinate, exactly, so there is one rule rather than a
+special case: a depth contact is inside the brain because that is where it is,
+and it stays a straight track as the cortex inflates. Turn ``surface_opacity``
+down to see contacts that are inside.
+
+Turning ``offsets`` off pins every contact to the sheet. That is the older
+behaviour and still the better picture for a subdural grid read against the
+surface it sits on: the measured coordinate on the anatomical surface, crossing
+to the projected anchor as the morph begins.
 
 The ``electrodes`` folder holds:
 
@@ -307,6 +383,9 @@ The ``electrodes`` folder holds:
 ``connections``
     Join contacts that are neighbours on the same device (see below). On by
     default.
+``offsets``
+    Draw contacts at their real distance off the surface rather than on it. On
+    by default. Turn it off to read a grid against the sheet it sits on.
 ``depth_window``
     Hide contacts more than this many millimetres from the depth being sampled.
     The top of the slider means no filtering rather than a 20 mm window, which

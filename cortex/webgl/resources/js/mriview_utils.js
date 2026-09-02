@@ -229,6 +229,58 @@ var mriview = (function(module) {
         return {pos:pos, norm:norm};
     }
 
+    //Returns an orthonormal frame for a triangle under the current mix state,
+    //along with the barycentric origin inside it and a measure of its size.
+    //
+    //This is the browser half of cortex.electrodes._anchor._triangle_basis, and
+    //it exists for the same reason: it is what lets a point that is *off* the
+    //surface be carried onto a deformed one. Three barycentric weights say
+    //where in the sheet a contact sits; three signed millimetres along this
+    //frame say how far off it. The frame rotates and stretches with the surface,
+    //so re-expressing that residual never interpolates between two points that
+    //are close in space but far apart through the tissue -- which is the whole
+    //difficulty, since inflation moves the two banks of a sulcus centimetres
+    //apart while they sit two millimetres from each other.
+    //
+    //Built from get_position rather than from the raw buffers so it inherits the
+    //same thickness, flat-offset and morph-blend logic that moves the surface
+    //itself, exactly as get_position_bary does.
+    //
+    //`scale` is sqrt(2 * area), a length-like measure of the triangle's size.
+    //From the area rather than an edge because the quantity wanted is isotropic
+    //and *which* corner is written first is an artifact of the mesh.
+    module.get_position_frame = function(posdata, surfmix, thickmix, verts, weights) {
+        var p = [];
+        for (var i = 0; i < 3; i++)
+            p.push(module.get_position(posdata, surfmix, thickmix, verts[i]).pos);
+
+        var origin = new THREE.Vector3(0, 0, 0);
+        for (var i = 0; i < 3; i++)
+            origin.add(p[i].clone().multiplyScalar(weights[i]));
+
+        var e1 = p[1].clone().sub(p[0]);
+        var e2 = p[2].clone().sub(p[0]);
+        var normal = new THREE.Vector3().crossVectors(e1, e2);
+        var twice_area = normal.length();
+        if (twice_area === 0 || e1.length() === 0)
+            return null;               //degenerate triangle: no frame exists
+        normal.divideScalar(twice_area);
+
+        //e1 lies in the triangle's plane, so it is already perpendicular to the
+        //normal and this projection is a no-op to floating point. Kept so a
+        //nearly-degenerate triangle degrades smoothly rather than tilting the
+        //frame out of the surface.
+        var t1 = e1.clone().sub(normal.clone().multiplyScalar(e1.dot(normal)));
+        var len = t1.length();
+        if (len === 0)
+            return null;
+        t1.divideScalar(len);
+        var t2 = new THREE.Vector3().crossVectors(normal, t1);
+
+        return {origin:origin, t1:t1, t2:t2, normal:normal,
+                scale:Math.sqrt(twice_area)};
+    }
+
     module.computeNormal = function(vertices, index, offsets) {
         var i, il;
         var j, jl;

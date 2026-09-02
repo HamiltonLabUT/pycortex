@@ -21,12 +21,16 @@ import numpy as np
 import numpy.typing as npt
 
 from ._anchor import (
+    ANCHOR_AUTO,
     HEMIS,
+    OFFSET_NONE,
+    SCALE_AUTO,
     ElectrodeAnchors,
     PlacementPolicy,
     SurfacePair,
     anchor_to_surfaces,
     classify_placement,
+    regroup_anchors,
 )
 
 GROUP_TYPES = ("grid", "strip", "seeg", "depth")
@@ -409,6 +413,7 @@ class ElectrodeSet:
         subject: Optional[str] = None,
         policy: Optional[PlacementPolicy] = None,
         surfaces: Optional[Mapping[str, SurfacePair]] = None,
+        anchor_mode: str = ANCHOR_AUTO,
         inplace: bool = True,
     ) -> ElectrodeAnchors:
         """Compute this set's surface anchors, loading the surfaces if needed.
@@ -424,6 +429,12 @@ class ElectrodeSet:
             pycortex does not hold. Taken to be in the same space as
             :attr:`coords`, so no offset is applied: passing surfaces means
             taking responsibility for the frame they are in.
+        anchor_mode : {"auto", "per_contact", "per_device"}
+            Whether a device's contacts share one frame. :data:`ANCHOR_AUTO`
+            shares it for ``seeg`` and ``depth`` groups and not for the rest,
+            which is what a mixed montage wants -- a shaft is one rigid object
+            threading folds, a grid drapes over them. Only affects
+            :meth:`positions` with ``offset="frame"``.
         inplace : bool
             Store the result on the set as well as returning it.
 
@@ -437,6 +448,11 @@ class ElectrodeSet:
         be. :func:`surface_space_offset` reads which, and the difference is
         added here rather than to :attr:`coords`, so the set keeps the
         coordinates its montage file actually contains.
+
+        That shifted copy is also what the frame is measured against. It has to
+        be: a frame computed from the raw column and evaluated against stored
+        surfaces would carry the whole ``c_ras`` offset as a spurious residual,
+        which is the same few-millimetre error in a new place.
         """
         offset = np.zeros(3)
         if surfaces is None:
@@ -447,8 +463,17 @@ class ElectrodeSet:
                 )
             surfaces = load_surface_pairs(subject)
             offset = surface_space_offset(subject)
+        coords = self.coords + offset
         anchors = anchor_to_surfaces(
-            self.coords + offset, surfaces, policy=policy, anatomy=self.anatomy
+            coords, surfaces, policy=policy, anatomy=self.anatomy
+        )
+        anchors = regroup_anchors(
+            anchors,
+            coords,
+            {h: surfaces[h].pia for h in surfaces},
+            groups=self.group,
+            group_types=self.group_type,
+            mode=anchor_mode,
         )
         if inplace:
             self.anchors = anchors
@@ -462,7 +487,8 @@ class ElectrodeSet:
         return self.anchors.placement
 
     def positions(self, surface_type: str = "flat", subject: Optional[str] = None,
-                  nudge: bool = True) -> npt.NDArray[np.floating]:
+                  nudge: bool = True, offset: str = OFFSET_NONE,
+                  scale_mode: str = SCALE_AUTO) -> npt.NDArray[np.floating]:
         """Where these electrodes sit on some surface of the subject.
 
         Parameters
@@ -476,6 +502,16 @@ class ElectrodeSet:
             shifts the hemispheres apart for every surface except the fiducial.
             On for flatmaps, where the two hemispheres are laid out side by
             side. Anchoring itself always happens un-nudged.
+        offset : {"none", "frame"}
+            :data:`OFFSET_NONE` puts every contact on the surface, which is the
+            long-standing behaviour and stays the default.
+            :data:`OFFSET_FRAME` keeps it at its real distance off the surface,
+            so a depth electrode reads as a track through the brain rather than
+            as scatter on the sheet. Asking for ``"pia"`` this way returns the
+            input coordinates exactly.
+        scale_mode : {"auto", "similarity", "anisotropic", "rigid"}
+            How the off-surface displacement is scaled when the surface
+            stretches. See :mod:`cortex.electrodes._anchor`.
 
         Returns
         -------
@@ -490,7 +526,9 @@ class ElectrodeSet:
             raise ValueError("positions() needs a subject")
 
         left, right = db.get_surf(subject, surface_type, "both", nudge=nudge)
-        return self.anchors.evaluate({"lh": left[0], "rh": right[0]})
+        return self.anchors.evaluate(
+            {"lh": left[0], "rh": right[0]}, offset=offset, scale_mode=scale_mode
+        )
 
 
 #: GIFTI's code for "these coordinates are in the scanner's frame"

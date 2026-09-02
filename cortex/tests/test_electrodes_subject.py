@@ -20,6 +20,7 @@ from cortex.electrodes import (
     anchor_to_surfaces,
     check_alignment,
     load_surface_pairs,
+    regroup_anchors,
 )
 
 SUBJECT = "S1"
@@ -259,6 +260,242 @@ def test_a_grid_slid_along_the_surface_is_not_caught(grid_electrodes, pairs):
     report = check_alignment(grid_electrodes + np.array([8.0, 0, 0]), pairs)
     assert not report.suspicious
     assert report.median_offset_mm < 3.0
+
+
+# -- keeping electrodes off the surface, on real cortex ---------------------
+
+@pytest.fixture(scope="module")
+def shaft_electrodes(pairs):
+    """A depth electrode: 15 contacts at a uniform 4 mm pitch, driven 56 mm in.
+
+    Straight along the pial normal from one vertex, which is not how a surgeon
+    plans a trajectory but is the only construction whose right answer is known
+    in advance -- a straight line at even spacing. That is exactly what the
+    assertions below check survives the trip to the inflated surface.
+
+    The seed is chosen so the shaft stays inside its own hemisphere: entering at
+    a laterally-facing vertex, it reaches x = -14.7 mm and stops. This matters,
+    and the obvious seed does not satisfy it -- a shaft driven 56 mm inward from
+    a medially-facing vertex crosses the midline and ends up anchored to the
+    *other* hemisphere, which no real trajectory does. Every contact also clears
+    the default 4 mm placement policy, so nothing here is testing an electrode
+    the policy would have excluded anyway.
+    """
+    from cortex import polyutils
+
+    pair = pairs["lh"]
+    normals = np.asarray(
+        polyutils.Surface(pair.pia.astype(np.float64), pair.polys).vertex_normals
+    )
+    seed = 84217
+    return pair.pia[seed] - np.outer(np.arange(0, 60, 4.0), normals[seed])
+
+
+def test_the_shaft_fixture_is_a_trajectory_a_surgeon_could_plan(shaft_electrodes, pairs):
+    """Guard on the fixture, because the failure it prevents is silent.
+
+    A shaft that crosses the midline gets split into two devices by
+    :func:`regroup_anchors` -- correctly, since a device may not span
+    hemispheres -- and every assertion about "the device" below then quietly
+    describes half of one.
+    """
+    anchors = anchor_to_surfaces(shaft_electrodes, pairs)
+    assert (anchors.hemi == "lh").all()
+    assert anchors.placeable.all()
+    assert shaft_electrodes[:, 0].max() < -10.0
+
+
+def test_a_frame_returns_the_coordinate_on_the_surface_it_was_measured_on(
+    grid_electrodes, shaft_electrodes, pairs
+):
+    """The exactness claim, on folded cortex rather than a synthetic sheet.
+
+    Catches a sign error, a non-orthonormal basis, or a ``c_ras`` offset applied
+    on one side and not the other -- all at once, and all as an exact equality
+    rather than a threshold somebody would have had to choose.
+    """
+    coords = np.vstack([grid_electrodes, shaft_electrodes])
+    anchors = anchor_to_surfaces(coords, pairs)
+    surfaces = {h: pair.pia for h, pair in pairs.items()}
+
+    back = anchors.evaluate(surfaces, offset="frame")
+    assert np.abs(back - coords).max() < 1e-6
+
+    # The projection is a genuinely different answer, or the test above would
+    # pass for a no-op. Note how *small* the difference is: even a contact 56 mm
+    # inside the brain is moved only 5.7 mm by being projected, because cortex
+    # folds densely enough that it is never far from some sulcal bank. That is
+    # why this failure is invisible contact by contact and only shows up in the
+    # relative geometry -- the pitch test below is where it becomes obvious.
+    moved = np.linalg.norm(anchors.evaluate(surfaces) - coords, axis=1)
+    assert moved[-15:].max() > 3.0
+    assert moved[-15:].max() < 10.0
+
+
+def test_a_shaft_keeps_a_uniform_pitch_and_stays_straight_when_inflated(
+    shaft_electrodes, pairs
+):
+    """The failure this whole mechanism exists for.
+
+    Anchored per contact, the shaft does not survive inflation: cortex folds
+    densely enough that consecutive contacts anchor to different sulcal banks,
+    and the device arrives as scatter. Measured here rather than asserted from
+    the design document, so the "before" cannot rot.
+
+    Anchored once and carried through that frame, it is a rigid body: the pitch
+    is uniform and the contacts collinear to floating point. Both are exact
+    because a shared orthonormal frame with one scale is a similarity
+    transform -- a tolerance band here would pass for the anisotropic shear,
+    which tilts the shaft off its trajectory and makes the pitch uneven.
+    """
+    coords = shaft_electrodes
+    groups, types = ["LTD"] * len(coords), ["seeg"] * len(coords)
+    surfaces = {h: pair.pia for h, pair in pairs.items()}
+    inflated = {
+        hemi: cortex.db.get_surf(SUBJECT, "inflated", hemi, nudge=False)[0]
+        for hemi in pairs
+    }
+
+    per_contact = anchor_to_surfaces(coords, pairs)
+    # The before. Fifteen contacts, fifteen different anchor triangles, spread
+    # over the folds the shaft passes: a uniform 4 mm pitch arrives on the
+    # inflated surface as 1.7 mm at one step and 40 mm at another. The recorded
+    # `depth` gives the reason -- it runs from 0 to 9.2 and back to -0.9, since
+    # each contact reports a depth relative to whichever bank it landed near
+    # rather than to the column it entered through.
+    assert len(np.unique(per_contact.verts[:, 0])) == len(coords)
+    loose = np.linalg.norm(np.diff(per_contact.evaluate(inflated), axis=0), axis=1)
+    assert loose.min() < 2.0 and loose.max() > 30.0
+
+    shared = regroup_anchors(per_contact, coords, surfaces, groups, types)
+    assert len(np.unique(shared.hosts)) == 1
+
+    positions = shared.evaluate(inflated, offset="frame")
+    steps = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    assert steps.max() - steps.min() < 1e-6
+
+    centred = positions - positions.mean(0)
+    axis = np.linalg.svd(centred, full_matrices=False)[2][0]
+    assert np.linalg.norm(centred - np.outer(centred @ axis, axis), axis=1).max() < 1e-6
+
+    # The pitch tracks inflation rather than staying at 4 mm.
+    assert 0.3 < steps.mean() / 4.0 < 1.5
+
+
+def test_the_device_scale_is_not_taken_from_the_anchor_contact(shaft_electrodes, pairs):
+    """Why the scale is a median over the device rather than its anchor's own.
+
+    A shaft is anchored near its entry, and an entry point sits on a gyral
+    crown, which inflates quite differently from the tissue the shaft threads.
+    Taking the anchor triangle's own scale stretched two of three test shafts by
+    more than 60%. The median over the device's contacts is a far steadier
+    estimate of the territory it actually crosses.
+    """
+    from cortex.electrodes._anchor import _triangle_basis
+
+    coords = shaft_electrodes
+    surfaces = {h: pair.pia for h, pair in pairs.items()}
+    anchors = regroup_anchors(
+        anchor_to_surfaces(coords, pairs), coords, surfaces,
+        ["LTD"] * len(coords), ["seeg"] * len(coords),
+    )
+    inflated = cortex.db.get_surf(SUBJECT, "inflated", "lh", nudge=False)[0]
+
+    own = _triangle_basis(inflated[anchors.verts])[3] / anchors.frame_scale_mm
+    host_only = own[int(anchors.hosts[0])]
+    device = np.nanmedian(own)
+
+    # They genuinely disagree, which is the whole reason for the choice.
+    assert abs(host_only - device) / device > 0.05
+
+    # And the pitch that comes out follows the median, not the anchor's own.
+    steps = np.linalg.norm(
+        np.diff(anchors.evaluate({"lh": inflated}, offset="frame"), axis=0), axis=1
+    )
+    assert steps.mean() == pytest.approx(4.0 * device, rel=1e-6)
+
+
+def test_a_grid_still_drapes_over_the_folds(grid_electrodes, pairs):
+    """``auto`` must not turn a grid into a rigid sheet.
+
+    A grid's contacts each sit on their own column, and the spread in their
+    spacing after inflation is the signal -- it is what says which contacts were
+    buried in a sulcus. Holding them rigid would float the grid above the
+    surface and hide exactly that.
+    """
+    coords = grid_electrodes
+    surfaces = {h: pair.pia for h, pair in pairs.items()}
+    anchors = regroup_anchors(
+        anchor_to_surfaces(coords, pairs), coords, surfaces,
+        ["LG"] * len(coords), ["grid"] * len(coords),
+    )
+    assert len(np.unique(anchors.hosts)) == len(coords)
+
+    inflated = {"lh": cortex.db.get_surf(SUBJECT, "inflated", "lh", nudge=False)[0]}
+    on = anchors.evaluate(inflated)
+    off = anchors.evaluate(inflated, offset="frame")
+
+    # Barely moved: a subdural contact is a fraction of a millimetre from the
+    # column it anchors to, so drawing it off the surface changes little. That
+    # is the correct outcome for a grid, and it is why the mechanism is worth
+    # having only for depth electrodes.
+    assert np.linalg.norm(off - on, axis=1).max() < 3.0
+
+    # And it still warps: the spread in neighbour spacing survives.
+    spacing = np.linalg.norm(off[:, None, :] - off[None, :, :], axis=2)
+    nearest = np.sort(spacing, axis=1)[:, 1]
+    assert nearest.max() / nearest.min() > 2.0
+
+
+def test_rigid_preserves_the_residual_length_on_every_surface(grid_electrodes, pairs):
+    """What ``rigid`` claims, checked on both the inflated and the flat surface.
+
+    The distance from an electrode to its anchor point, in millimetres, is
+    unchanged by evaluating it anywhere else. This is the invariant that is
+    well-defined for a grid -- distance from the *anchor*, not from the vertex
+    the contact was placed above, which anchoring is free to disagree about.
+    """
+    coords = grid_electrodes
+    anchors = anchor_to_surfaces(coords, pairs)
+    surfaces = {h: pair.pia for h, pair in pairs.items()}
+    residual = np.linalg.norm(coords - anchors.evaluate(surfaces), axis=1)
+
+    for surface_type in ("inflated", "flat"):
+        target = {
+            hemi: cortex.db.get_surf(SUBJECT, surface_type, hemi, nudge=False)[0]
+            for hemi in pairs
+        }
+        moved = np.linalg.norm(
+            anchors.evaluate(target, offset="frame", scale_mode="rigid")
+            - anchors.evaluate(target),
+            axis=1,
+        )
+        assert np.abs(moved - residual).max() < 1e-6
+
+
+def test_the_set_threads_it_through_positions(pairs, shaft_electrodes):
+    """The public path: ``anchor()`` groups, ``positions()`` offsets."""
+    eset = ElectrodeSet(
+        names=["LTD%d" % i for i in range(len(shaft_electrodes))],
+        coords=shaft_electrodes,
+        group=["LTD"] * len(shaft_electrodes),
+        group_type=["seeg"] * len(shaft_electrodes),
+        subject=SUBJECT,
+    )
+    eset.anchor()
+    assert len(np.unique(eset.anchors.hosts)) == 1
+
+    on = eset.positions("inflated", nudge=False)
+    off = eset.positions("inflated", nudge=False, offset="frame")
+    assert not np.allclose(on, off)
+
+    steps = np.linalg.norm(np.diff(off, axis=0), axis=1)
+    assert steps.max() - steps.min() < 1e-6
+
+    # Asking for the pia gives the coordinates back, through the whole stack.
+    assert np.abs(
+        eset.positions("pia", nudge=False, offset="frame") - shaft_electrodes
+    ).max() < 1e-6
 
 
 # -- filestore round-trip ---------------------------------------------------

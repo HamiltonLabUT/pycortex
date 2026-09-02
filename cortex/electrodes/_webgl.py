@@ -67,6 +67,7 @@ def to_viewer_json(
     color: str = "#ffcc33",
     connections: bool = True,
     line_color: Optional[str] = None,
+    offsets: bool = True,
 ) -> dict[str, Any]:
     """Serialise an electrode set for the browser.
 
@@ -102,6 +103,16 @@ def to_viewer_json(
     line_color : str, optional
         A CSS colour for those lines. The marker ``color`` by default, which
         keeps a device reading as one object.
+    offsets : bool
+        Draw each contact at its real distance off the surface rather than on
+        it, by carrying its stored frame residual onto whatever the inflation
+        slider is showing. On by default, and the viewer exposes a toggle.
+
+        It matters most for depth electrodes and hardly at all for a subdural
+        grid, whose contacts sit a fraction of a millimetre from the column they
+        anchor to. Measured on S1, a shaft at a uniform 4 mm pitch *projected*
+        onto the inflated surface has consecutive spacings from 1.7 to 40.5 mm;
+        carried through one frame they are all equal.
 
     Returns
     -------
@@ -116,6 +127,7 @@ def to_viewer_json(
 
     anchors = eset.anchors
     keep = anchors.placeable if placeable_only else np.ones(len(eset), dtype=bool)
+    host = anchors.hosts
 
     # The viewer draws `coords` directly against the CTM, which is built from
     # the subject's stored surfaces -- so the coordinates have to be in *their*
@@ -161,6 +173,24 @@ def to_viewer_json(
             "coords": [float(x) for x in coords[i]],
             "verts": _ctm_verts(anchors.verts[i], hemi, ctm_index, left_nverts),
             "weights": [float(w) for w in anchors.weights[i]],
+            # The residual, and the triangle it is measured against. Sent inline
+            # rather than as a reference to another contact, because the frame's
+            # host may itself have been dropped by `placeable_only` -- a shaft
+            # whose best-anchored contact was excluded still has fourteen others
+            # that need its frame.
+            "frame": _frame(anchors, i),
+            "frame_verts": _ctm_verts(
+                anchors.verts[host[i]], hemi, ctm_index, left_nverts
+            ),
+            "frame_weights": [float(w) for w in anchors.weights[host[i]]],
+            "frame_scale_mm": _finite(
+                None if anchors.frame_scale_mm is None else anchors.frame_scale_mm[i]
+            ),
+            # Which contacts move as one rigid device. The browser needs the
+            # grouping rather than a precomputed scale, because the surface it
+            # is scaling against is a morph target that changes with the slider,
+            # so the scale has to be recomputed on every mix event.
+            "device": int(host[i]),
             "depth": _finite(anchors.depth[i]),
             # Millimetres as well as the normalised depth, because the viewer's
             # depth window is specified in millimetres and cortical thickness
@@ -197,6 +227,7 @@ def to_viewer_json(
         # when it is handed one that does not match.
         "nelec": int(len(eset)),
         "radius": float(radius),
+        "offsets": bool(offsets),
         "color": color,
         "line_color": color if line_color is None else line_color,
         "subject": eset.subject,
@@ -218,5 +249,22 @@ def _ctm_verts(
 
 def _finite(value: Any) -> Optional[float]:
     """A float, or None where JSON cannot carry NaN."""
+    if value is None:
+        return None
     value = float(value)
     return None if not np.isfinite(value) else value
+
+
+def _frame(anchors: "ElectrodeAnchors", i: int) -> Optional[list[float]]:
+    """One contact's frame residual, or None if it has none or it is not finite.
+
+    All-or-nothing per contact: a frame with one NaN component is not a partial
+    answer, it is a degenerate anchor triangle, and half a displacement would
+    put the marker somewhere specific and wrong.
+    """
+    if anchors.frame is None:
+        return None
+    row = anchors.frame[i]
+    if not np.isfinite(row).all():
+        return None
+    return [float(x) for x in row]

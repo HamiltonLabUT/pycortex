@@ -449,6 +449,10 @@ Each phase is independently verifiable and independently useful.
   would make the topology depend on the inflation slider, with edges appearing
   and disappearing mid-morph, when the fact being drawn is a property of the
   physical device. See 6 below for how a grid's lattice is recovered.
+- **P3d** — *done.* Contacts drawn at their real distance *off* the surface,
+  rather than projected onto it. `evaluate(offset="frame")` in python and an
+  `offsets` toggle in the viewer. Not in the original phasing; §7 is why it
+  turned out to be necessary.
 - **P4** — billboards for STRF and evoked data. Not started.
 
 ## 3. Decisions taken
@@ -593,7 +597,187 @@ An explicit rows-by-columns field on `ElectrodeSet` would retire the width
 search, and remains the obvious upgrade if a montage ever turns up that the
 recovery gets wrong. It is not needed to draw the montages we have.
 
-## 7. Still to settle
+## 7. Projection destroys a depth electrode, and a frame is what fixes it
+
+§2.2 anchors every contact to the cortical column nearest it, and §2.3 says
+depth "has no geometric meaning once the surface is inflated or flat" and so
+decides *whether* a contact is drawn rather than *where*. For a subdural grid
+that is right. For a depth electrode it is wrong, and badly.
+
+Measured on S1: a 15-contact shaft at a uniform 4 mm pitch, driven 56 mm inward
+from a laterally-facing vertex. Anchored per contact and evaluated on the
+inflated surface, its consecutive spacings are
+
+    1.68  3.51  4.13  13.69  9.31  1.83  4.47  1.77  40.49  2.32 ...
+
+Fifteen contacts, fifteen different anchor triangles, spread across the folds
+the shaft passes through. The recorded `depth` runs 0 → 9.15 → −0.88, because a
+deep contact reports a depth relative to whichever bank it landed near rather
+than to the column it entered through. A 56 mm probe arrives as 39 mm of
+scatter.
+
+**Each contact individually looks fine, and that is the trap.** Projection moves
+no contact more than 5.7 mm, even one 56 mm inside the brain — the same folding
+fact §2.2 relies on, that cortex is dense enough that nothing is ever far from
+some bank. The damage is entirely in the *relative* geometry, so no per-contact
+check sees it. This is the same shape of failure as §1.4 and §5: it renders
+plausibly.
+
+### Why not an elastic or nonlinear warp
+
+The instinct is to treat the `(pia → inflated)` vertex pairs as landmarks and
+fit a thin-plate spline, RBF, or harmonic/elastic extension over the volume.
+That fails on a measurable property of the field. On S1 lh:
+
+| | Δ displacement |
+| --- | --- |
+| along a mesh edge (~0.96 mm) | 0.77 mm median, 7.07 max |
+| between vertices < 2 mm apart in space | up to **45.6 mm**; 7.1% exceed 10 mm |
+
+Those are the two banks of a sulcus. The inflation field is smooth *through
+tissue* and violently discontinuous *across space*, so any interpolant with a
+Euclidean kernel averages banks that inflation pulls centimetres apart and drops
+the contact in the CSF gap between them. An elastic solve additionally folds
+over — negative Jacobian — in every sulcus, since the boundary conditions on
+facing walls point opposite ways across a 2 mm gap. Registration tools (ANTs,
+elastix) do not apply at all: they estimate a warp from image-intensity
+correspondence, and there is no image of an inflated brain.
+
+FreeSurfer supplies no volumetric transform to invert either. `mris_inflate` and
+`mris_flatten` are relaxations that emit new vertex positions carrying the same
+vertex indices; the map exists only at the ~153k samples of a 2-manifold.
+
+### What is stored instead
+
+Three more numbers, in a basis the anchor triangle defines:
+
+```
+n̂  = the triangle's normal on the pia
+t̂1 = unit(pia[v1] − pia[v0]), orthogonalised against n̂
+t̂2 = n̂ × t̂1
+frame = [ (e−P)·t̂1 , (e−P)·t̂2 , (e−P)·n̂ ]
+```
+
+with `P` the barycentric anchor point. Because the *same three vertex indices*
+name a triangle on every surface of the subject, the basis can be rebuilt on the
+inflated or flat surface and the residual re-expressed there. Nothing is ever
+interpolated across a sulcus, which is precisely what the Euclidean methods
+cannot avoid. The same trade §2.2 made for barycentric weights over
+nearest-vertex: three extra floats to keep something that cannot be recovered.
+
+Evaluated against the pia, this returns the input coordinate **exactly** —
+7e-15 mm on real surfaces — which is a far sharper test than anything available
+before, and one `offset="none"` cannot pass.
+
+The scale factor is `sqrt(2·area)` of the triangle on target over source. From
+the area rather than an edge because the quantity wanted is isotropic and which
+corner is written first is an artifact of the mesh.
+
+### Frames alone are not enough: the anchor hops
+
+Re-expressing each contact's residual in its *own* triangle does not fix the
+shaft, because the anchor is what moved. So a device may share one frame:
+
+- `per_contact` — right for a grid or strip, which drapes over folds and whose
+  contacts each genuinely sit on their own column.
+- `per_device` — one anchor for the whole device, at the contact with the
+  smallest `offset_mm` (best explained by its column). Deliberately *not* the
+  shallowest: `depth` is untrustworthy for exactly the contacts this exists to
+  fix.
+- `auto` — `per_device` for `seeg`/`depth`, `per_contact` otherwise, keyed on
+  `group_type`, mirroring `MARKER_BY_GROUP_TYPE`.
+
+A device never spans hemispheres; contacts group by `(group, hemi)` so a
+bilateral or mislabelled group splits rather than anchoring across the midline.
+
+### `group_type` is usually not there, and the geometry can stand in
+
+Keying `auto` on `group_type` alone was nearly a silent failure. Of the three
+clinical montages in this filestore, **two record no `group_type` at all** — and
+all twenty-one of TCH06's groups are depth electrodes. `auto` shared no frames
+for 186 of its 186 contacts, on no better grounds than a missing column.
+
+A depth electrode is a rigid needle, and nothing else in the vocabulary is, so
+the geometry answers the question when the label does not. Distance from a
+group's own best-fit line:
+
+| device | max off-axis |
+| --- | --- |
+| 27 shafts (TCH06, S0033) | 0.00 – 0.45 mm |
+| 3 shafts (S0019) | 0.65 – 0.95 mm |
+| 64-contact grid (S0019 `LG`) | **49.04 mm** |
+
+Two orders of magnitude, so `STRAIGHT_TOLERANCE_MM = 2.0` is not a delicate
+number. It sits above the least straight real shaft — localisation from
+post-implant imaging is not exact — and far below anything that drapes. A strip
+is *linear but not straight*: it follows the convexity it lies on, and fails the
+test correctly. The asymmetry justifies a generous rather than tight tolerance:
+a strip wrongly grouped costs almost nothing, since it hugs the surface either
+way, while a shaft that fails to group scatters over tens of millimetres.
+
+An explicit `group_type` is always believed, in both directions. The fallback
+decides the missing case; it does not second-guess a column somebody filled in,
+because a 1×N grid is a legal thing to record.
+
+With the fallback, TCH06 goes from 0 to 186/186 contacts in 21 rigid devices,
+and S0019 picks up its 3 depth electrodes while correctly leaving its 64-contact
+grid per-contact.
+
+### Which scale, and why not the anchor's own
+
+With one frame there is one scale factor. Taking it from the frame-defining
+contact is the obvious choice and is wrong: a shaft is anchored near its entry,
+and entry points sit on gyral crowns, which inflate quite differently from the
+tissue a shaft threads.
+
+| shaft | entry-only `s` | device median `s` | error |
+| --- | --- | --- | --- |
+| v40000 | 0.661 | 0.648 | 2% |
+| v80000 | 0.917 | 0.550 | **67%** |
+| v120000 | 0.852 | 0.524 | **63%** |
+
+So the two halves come from different places on purpose: **frame from the entry
+anchor** (one triangle, no hopping), **scale from the median over the device's
+contacts** (an aggregate, so hopping averages out).
+
+### What is and is not preserved
+
+| | `per_device` | `per_contact` |
+| --- | --- | --- |
+| within-group spacing | **uniform**, scaled by `s` | follows local stretch |
+| straightness / entry angle | **exact** | n/a |
+| distance off the sheet | scaled by `s` | exact, mm |
+
+A uniform scale on all three axes is a similarity transform, so a shaft's shape
+and entry angle survive exactly while its size follows the cortex around it.
+Scaling only the tangential axes is a *shear*: sound per contact, where the
+tangential residual is sub-millimetre, and wrong for a device, where it tilts
+the shaft off its trajectory. `test_a_shaft_keeps_a_uniform_pitch_and_stays_
+straight_when_inflated` asserts equality rather than a tolerance band precisely
+so the shear cannot pass.
+
+A grid deliberately keeps *none* of this rigidity. Inflation stretches and
+compresses the sheet (edge ratio p5 0.44, p50 0.85, p95 1.92) and that spread is
+the signal — it says which contacts were buried in a sulcus. Holding a grid
+rigid would float it above the surface and hide exactly that.
+
+Two fixture traps found while writing the tests, both of which produce
+confident-looking wrong numbers:
+
+- **A shaft driven inward from a medially-facing vertex crosses the midline**
+  and gets split into two devices, correctly, after which every assertion about
+  "the device" quietly describes half of one. The fixture now enters laterally
+  and a guard test asserts it stays in its hemisphere.
+- **A "grid" built from the *n* nearest vertices to a point spans facing banks**
+  on folded cortex, so its contacts anchor across a sulcus and sit inside the
+  ribbon relative to the far wall. The existing `grid_electrodes` fixture has
+  always done this. It is why the well-defined invariant for a grid is distance
+  from its *anchor*, not from the vertex it was placed above.
+
+`offset="none"` remains the default everywhere, so nothing that does not ask for
+this changes.
+
+## 8. Still to settle
 
 Both of the questions this section opened with have since been answered, in
 the course of P1 and P3. Recorded here rather than deleted, because the answers
