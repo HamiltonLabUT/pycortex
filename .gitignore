@@ -29,6 +29,7 @@ lib64
 filestore/db/*/cache
 filestore/db/*/surface-info
 filestore
+filestore/db/*
 
 # Installer logs
 pip-log.txt
